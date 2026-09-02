@@ -391,6 +391,7 @@ def process_one(src: pathlib.Path, args):
     print(f"[2/3] STT ({args.language})...", flush=True)
     segments, stt_info = cut_and_transcribe(src, vad, args.model, args.language)
     t_stt = time.time() - t1
+    t_llm = 0.0
     draft_words = sum(len(s["text"].split()) for s in segments)
     print(f"      {stt_info['sent']} сегментов, {draft_words} слов — {t_stt:.0f}с", flush=True)
 
