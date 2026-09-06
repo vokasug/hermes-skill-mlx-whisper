@@ -139,7 +139,10 @@ def cut_and_transcribe(src: pathlib.Path, vad: dict, model: str, language: str) 
                 condition_on_previous_text=False, fp16=True, verbose=False)
             for seg in res["segments"]:
                 txt = seg["text"].strip()
-                if txt:
+                # drop content-free segments: Whisper on tiny non-speech VAD blips
+                # (music/applause) hallucinates pure punctuation runs ("! ! !", "♪");
+                # they carry no speech and would explode into one line per token downstream
+                if txt and re.search(r"\w", txt):
                     all_segments.append({"start": round(seg["start"] + cs, 2),
                                          "end": round(seg["end"] + cs, 2), "text": txt})
     return all_segments, {"sent": len(segs)}
