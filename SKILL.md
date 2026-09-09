@@ -20,9 +20,13 @@ metadata:
 ## Environment (проверено 2026-08-30)
 
 - CLI: `mlx_whisper` (uv tool `mlx-whisper` 0.4.3, окружение изолировано, обновление: `uv tool upgrade mlx-whisper`)
-- Модель: **whisper-podlodka-turbo fp16 (16 бит)** локально в
-  `~/.local/share/models/whisper-podlodka-turbo-MLX-fp16/` (config.json + weights.safetensors, 1.5 ГБ)
-  Источник: evilfreelancer/whisper-podlodka-turbo-MLX (fp16/), база bond005/whisper-podlodka-turbo
+- Модель: **whisper-podlodka-turbo q8 (8 бит)** локально в
+  `~/.local/share/models/whisper-podlodka-turbo-MLX-q8/` (config.json + weights.safetensors, 824 МБ)
+  Источник: evilfreelancer/whisper-podlodka-turbo-MLX (q8/), база bond005/whisper-podlodka-turbo.
+  Дефолт q8 с 2026-09-09: замер на 5-мин русской речи — q8 на ~22% быстрее fp16 (19 с vs 24.5 с
+  с загрузкой модели) при совпадении текста 99.8% (2 мелких расхождения из 1073 слов).
+  fp16 остаётся доступным в `~/.local/share/models/whisper-podlodka-turbo-MLX-fp16/` — передать
+  путь явно через `--model` (сырой CLI) / аргумент модели скриптов.
 - Тянет ffmpeg для декодирования не-wav аудио; wav 24k mono берёт как есть
 - Тест-эталон: 15.7 c русская речь → чистый текст за 4.6 c (RAM 1.85 ГБ)
 
@@ -63,7 +67,7 @@ metadata:
 
 ```bash
 # субтитры + таймстампы слов
-mlx_whisper --model ~/.local/share/models/whisper-podlodka-turbo-MLX-fp16 \
+mlx_whisper --model ~/.local/share/models/whisper-podlodka-turbo-MLX-q8 \
   --language ru --condition-on-previous-text False \
   --output-format srt --word-timestamps True --output-dir /tmp/stt <аудио>
 
@@ -103,9 +107,9 @@ mlx_whisper --model ~/.local/share/models/whisper-podlodka-turbo-MLX-fp16 \
   Concurrency limit провайдера = 50, чанки коррекции гонять параллельно (10 потоков).
 - initial-prompt НЕ исправляет термины (codecs/DeepSeek остаются) и даёт регрессы (Ox→Aux) —
   только для стиля; орфографию терминов чинит LLM-этап по канон-списку.
-- `--fp16` флаг CLI не трогать: он про float16 при декодировании в оригинальном whisper, веса тут уже fp16 в safetensors.
+- `--fp16` флаг CLI не трогать: он про float16 при декодировании в оригинальном whisper, не про формат весов.
 - Русские таймстампы srt сдвигаются на паузах — для точного монтажа включать `--word-timestamps True`.
-- Если нужны q4/q8 (меньше RAM): скачать соотв. папку из того же HF-репо рядом и передать её путь.
+- Если нужен другой квант (q4 — меньше RAM, fp16 — чуть точнее): скачать соотв. папку из того же HF-репо рядом и передать её путь.
 
 ## Verification
 

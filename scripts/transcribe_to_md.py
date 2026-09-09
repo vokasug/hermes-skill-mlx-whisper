@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Transcribe audio via mlx_whisper (podlodka-turbo fp16) -> dated Markdown file.
+"""Transcribe audio via mlx_whisper (podlodka-turbo q8) -> dated Markdown file.
 
 Output: /Users/alexander/result-mlx-whisper/YYYY-MM-DD_<audio-basename>.md
 Only stdlib + mlx_whisper CLI. Model lives in RAM only while mlx_whisper runs.
@@ -11,7 +11,7 @@ import pathlib
 import subprocess
 import tempfile
 
-MODEL = pathlib.Path.home() / ".local/share/models/whisper-podlodka-turbo-MLX-fp16"
+MODEL = pathlib.Path.home() / ".local/share/models/whisper-podlodka-turbo-MLX-q8"
 OUT_DIR = pathlib.Path("/Users/alexander/result-mlx-whisper")
 
 
@@ -55,7 +55,7 @@ def transcribe_one(src: pathlib.Path, model: str, language: str) -> pathlib.Path
         f"- **Дата:** {datetime.date.today().isoformat()}",
         f"- **Источник:** `{src}`",
         f"- **Длительность:** {fmt_ts(dur)}",
-        f"- **Модель:** whisper-podlodka-turbo-MLX (fp16), язык: {language}",
+        f"- **Модель:** {MODEL.name}, язык: {language}",
         "",
         "## Текст",
         "",

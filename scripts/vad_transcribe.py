@@ -37,7 +37,7 @@ HOME = pathlib.Path.home()
 VAD_PY = HOME / ".local/share/stt-vad/venv/bin/python"
 VAD_SCRIPT = pathlib.Path(__file__).parent / "vad_segments.py"   # sibling in skill scripts/
 VAD_MODEL = HOME / ".local/share/models/silero-vad/silero_vad.onnx"
-DEFAULT_MODEL = str(HOME / ".local/share/models/whisper-podlodka-turbo-MLX-fp16")
+DEFAULT_MODEL = str(HOME / ".local/share/models/whisper-podlodka-turbo-MLX-q8")
 OUT_DIR = pathlib.Path("/Users/alexander/result-mlx-whisper")
 ENV_FILE = HOME / ".hermes/.env"
 ZAI_URL = "https://api.z.ai/api/paas/v4/chat/completions"
@@ -433,7 +433,7 @@ def process_one(src: pathlib.Path, args):
         f"- **Дата:** {datetime.date.today().isoformat()}",
         f"- **Источник:** `{src}`",
         f"- **Длительность:** {fmt_ts(vad['duration'])} | речь (VAD): {speech_s/60:.1f} мин ({vad['speech_ratio']*100:.0f}%)",
-        f"- **Модель:** whisper-podlodka-turbo-MLX (fp16), язык: {args.language}, VAD: Silero",
+        f"- **Модель:** {pathlib.Path(args.model).name}, язык: {args.language}, VAD: Silero",
         f"- **LLM-коррекция:** {llm_line}",
         f"- **Время:** VAD {t_vad:.0f}с + STT {t_stt:.0f}с + LLM {t_llm:.0f}с = {total/60:.1f} мин",
         "", "## Транскрипт", "",

@@ -4,7 +4,7 @@
 
 ## Что умеет
 
-- **Локальный STT** — whisper-podlodka-turbo fp16 (специализирована на русском, база bond005/whisper-podlodka-turbo, MLX-конверсия evilfreelancer); английский тоже поддерживается
+- **Локальный STT** — whisper-podlodka-turbo q8 (специализирована на русском, база bond005/whisper-podlodka-turbo, MLX-конверсия evilfreelancer); английский тоже поддерживается
 - **Полный пайплайн `vad_transcribe.py`**: Silero VAD (паузы/шумы отрезаются) → нарезка на сегменты ≤28 с → Whisper → LLM-коррекция терминов
 - **LLM-коррекция терминов** — glm-5.3-flash (`reasoning_effort=low`): regex-препасс по встроенному словарю + LLM-чанки ~1200 слов × 10 потоков с word-diff верификацией; без ключа честно деградирует до regex-результата
 - **Готовый Markdown** — транскрипт блоками ~60 с (`**mm:ss** текст`), метаданные (дата, источник, длительность, модель, время этапов) + таблица сегментов; файл `~/result-mlx-whisper/YYYY-MM-DD_<имя>.md`
@@ -26,16 +26,16 @@ uv tool install mlx-whisper
 
 `uv tool install` ставит CLI `mlx_whisper` в изолированное окружение (~/.local/share/uv/tools/mlx-whisper/). Обновление: `uv tool upgrade mlx-whisper`.
 
-### 2. Модель whisper-podlodka-turbo fp16 (1.5 ГБ)
+### 2. Модель whisper-podlodka-turbo q8 (824 МБ)
 
 ```bash
-mkdir -p ~/.local/share/models/whisper-podlodka-turbo-MLX-fp16
-cd ~/.local/share/models/whisper-podlodka-turbo-MLX-fp16
-curl -LO https://huggingface.co/evilfreelancer/whisper-podlodka-turbo-MLX/resolve/main/fp16/config.json
-curl -LO https://huggingface.co/evilfreelancer/whisper-podlodka-turbo-MLX/resolve/main/fp16/weights.safetensors
+mkdir -p ~/.local/share/models/whisper-podlodka-turbo-MLX-q8
+cd ~/.local/share/models/whisper-podlodka-turbo-MLX-q8
+curl -LO https://huggingface.co/evilfreelancer/whisper-podlodka-turbo-MLX/resolve/main/q8/config.json
+curl -LO https://huggingface.co/evilfreelancer/whisper-podlodka-turbo-MLX/resolve/main/q8/weights.safetensors
 ```
 
-Важно: модель передаётся в скрипты **путём к папке**, не HF-id — работает офлайн и без сюрпризов кэша HuggingFace. Если нужно меньше RAM — в том же репозитории есть `q4/` и `q8/`.
+Важно: модель передаётся в скрипты **путём к папке**, не HF-id — работает офлайн и без сюрпризов кэша HuggingFace. Дефолт q8: по замеру на русской речи он на ~22% быстрее fp16 при совпадении текста 99.8%. Если нужна максимальная точность или ещё меньше RAM — в том же репозитории есть `fp16/` и `q4/`.
 
 ### 3. Окружение VAD-пайплайна
 
@@ -98,7 +98,7 @@ python3 ~/.hermes/skills/media/mlx-whisper/scripts/transcribe_to_md.py <ауди
 
 ```bash
 # субтитры + таймстампы слов
-mlx_whisper --model ~/.local/share/models/whisper-podlodka-turbo-MLX-fp16 \
+mlx_whisper --model ~/.local/share/models/whisper-podlodka-turbo-MLX-q8 \
   --language ru --condition-on-previous-text False \
   --output-format srt --word-timestamps True --output-dir /tmp/stt <аудио>
 
