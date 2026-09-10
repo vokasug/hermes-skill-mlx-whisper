@@ -7,7 +7,7 @@ Run with the mlx-whisper uv tool python:
 Stages:
   1. VAD   (silero venv + onnx model)          -> speech intervals
   2. STT   (segments <=28s, one process, condition_on_previous_text=False)
-  3. LLM   (glm-5.3-flash, reasoning_effort=low) -> term spelling correction (chunks ~1200 words,
+  3. LLM   (deepseek-flash, reasoning_effort=low) -> term spelling correction (whole transcript;
            10 parallel, word-diff verified per chunk; failed chunk keeps regex-only result)
 
 Rendering: transcript is cut into sentences (by terminal punctuation of the word stream), then
@@ -40,7 +40,7 @@ VAD_MODEL = HOME / ".local/share/models/silero-vad/silero_vad.onnx"
 DEFAULT_MODEL = str(HOME / ".local/share/models/whisper-podlodka-turbo-MLX-q8")
 OUT_DIR = pathlib.Path("/Users/alexander/result-mlx-whisper")
 ENV_FILE = HOME / ".hermes/.env"
-ZAI_URL = "https://api.z.ai/api/paas/v4/chat/completions"
+LLM_MODEL = "deepseek-flash"   # DeepSeek V4.1-Flash; thinking on, reasoning_effort=low
 
 MAX_SEG = 28.0
 GAP_MERGE = 0.25
@@ -71,13 +71,19 @@ LOWER_STARTERS = {
 }
 
 
-def read_glm_key() -> str | None:
+def read_llm_config() -> tuple[str, str] | None:
+    """DeepSeek key + base URL from ~/.hermes/.env."""
     if not ENV_FILE.exists():
         return None
+    key = base = None
     for line in ENV_FILE.read_text().splitlines():
-        if line.startswith("GLM_API_KEY="):
-            return line.split("=", 1)[1].strip() or None
-    return None
+        if line.startswith("DEEPSEEK_API_KEY="):
+            key = line.split("=", 1)[1].strip() or None
+        elif line.startswith("DEEPSEEK_BASE_URL="):
+            base = line.split("=", 1)[1].strip() or None
+    if not key:
+        return None
+    return key, (base or "https://api.deepseek.com") + "/chat/completions"
 
 
 def fmt_ts(sec) -> str:
@@ -144,7 +150,8 @@ def cut_and_transcribe(src: pathlib.Path, vad: dict, model: str, language: str) 
                 # they carry no speech and would explode into one line per token downstream
                 if txt and re.search(r"\w", txt):
                     all_segments.append({"start": round(seg["start"] + cs, 2),
-                                         "end": round(seg["end"] + cs, 2), "text": txt})
+                                         "end": round(seg["end"] + cs, 2), "text": txt,
+                                         "logprob": seg.get("avg_logprob")})
     return all_segments, {"sent": len(segs)}
 
 
@@ -182,17 +189,19 @@ def build_chunks(segments: list, target_words: int = CHUNK_WORDS) -> list[list]:
     return chunks
 
 
-def glm_call(system: str, user: str, key: str, attempts: int = 2) -> str:
-    """zai chat completion. Short timeout + bounded retries: a hung/dropped call
-    must never stall the pipeline (parallel chunks wait for the slowest one)."""
-    body = {"model": "glm-5.3-flash",
+def llm_call(system: str, user: str, cfg: tuple[str, str], attempts: int = 2) -> str:
+    """DeepSeek chat completion (deepseek-flash, reasoning_effort=low; temperature is a
+    no-op while thinking is on — kept for compat). Short timeout + bounded retries:
+    a hung/dropped call must never stall the pipeline."""
+    key, url = cfg
+    body = {"model": LLM_MODEL,
             "messages": [{"role": "system", "content": system},
                          {"role": "user", "content": user}],
             "temperature": 0.1, "max_tokens": 65536, "reasoning_effort": "low"}
     last_exc = None
     for attempt in range(attempts):
         req = urllib.request.Request(
-            ZAI_URL, data=json.dumps(body).encode(),
+            url, data=json.dumps(body).encode(),
             headers={"Authorization": "Bearer " + key, "Content-Type": "application/json"})
         try:
             with urllib.request.urlopen(req, timeout=120) as r:
@@ -233,9 +242,177 @@ def regex_prepass(text: str) -> tuple[str, list]:
     return text, applied
 
 
-def correct_stage(segments: list, canonical: list[str], key: str) -> tuple[list, list, list]:
+def parse_subs(path: pathlib.Path) -> list[tuple[float, float, str]]:
+    """Parse .srt/.vtt into [(start, end, text)]. Tags stripped, rolling auto-caption
+    duplicates removed (YouTube auto-subs repeat the previous line in each cue)."""
+    raw = path.read_text(encoding="utf-8", errors="replace")
+    ts = r"(\d+):(\d+):(\d+)[,.](\d+)"
+    cues = []
+    for m in re.finditer(ts + r"\s*-->\s*" + ts + r"[^\n]*\n(.*?)(?=\n\s*\n|\n\d+\s*\n|\Z)",
+                         raw, flags=re.DOTALL):
+        h, mnt, s, ms = (int(m.group(i)) for i in range(1, 5))
+        h2, mnt2, s2, ms2 = (int(m.group(i)) for i in range(5, 9))
+        start = h * 3600 + mnt * 60 + s + ms / 1000
+        end = h2 * 3600 + mnt2 * 60 + s2 + ms2 / 1000
+        lines = [re.sub(r"<[^>]+>", "", ln).strip() for ln in m.group(9).strip().splitlines()]
+        lines = [ln for ln in lines if ln]
+        # rolling dedup: drop lines identical to the tail of the previous cue
+        if cues:
+            prev_lines = cues[-1][2].split("\n")
+            while lines and prev_lines and lines[0] == prev_lines[-1]:
+                lines.pop(0)
+                prev_lines = prev_lines[:-1]
+        if lines:
+            cues.append((start, end, "\n".join(lines)))
+    return cues
+
+
+def subs_for_range(cues: list, t0: float, t1: float, max_words: int = 700) -> str:
+    """Plain subtitle text overlapping [t0, t1] (5s padding), capped by word count."""
+    out, words = [], 0
+    for s, e, txt in cues:
+        if e < t0 - 5 or s > t1 + 5:
+            continue
+        w = len(txt.split())
+        if words + w > max_words:
+            break
+        out.append(txt)
+        words += w
+    return " ".join(out)
+
+
+WHOLE_MAX_WORDS = 8000     # <= this many words: correct the whole transcript in ONE LLM call
+SUBS_WHOLE_WORDS = 20000   # subtitle reference cap for a whole-transcript call
+
+
+def extract_terms_from_subs(sub_cues: list, draft_text: str, max_terms: int = 25) -> list[str]:
+    """Auto canonical terms from subtitles: capitalized words (>=2 occurrences in subs)
+    that the draft either lowercased or spelled similarly-but-wrong (fuzzy >=0.8).
+    Conservative: term is always the subs casing; never invent words absent from subs."""
+    subs_text = " ".join(t for _, _, t in sub_cues)
+    cand = collections.Counter(m.group(0) for m in re.finditer(r"\b[A-Z][\w.+-]{2,}\b", subs_text))
+    draft_words = set(draft_text.split())
+    draft_low_map = {}
+    for w in draft_words:
+        draft_low_map.setdefault(w.lower(), w)
+    draft_lows = set(draft_low_map)
+    terms, seen = [], set()
+    for w, n in cand.most_common():
+        if len(terms) >= max_terms:
+            break
+        if n < 2 or w.lower() in seen:
+            continue
+        lw = w.lower()
+        if lw in LOWER_STARTERS:
+            continue
+        # sentence-start filter: proper nouns stay capitalized mid-sentence; words that are
+        # capitalized ONLY at sentence starts (Yeah, However…) are not terms. Also, if the
+        # lowercase form occurs in subs at all, it's a common word (deep, flash…), skip.
+        if re.search(r"\b" + re.escape(lw) + r"\b", subs_text):
+            continue
+        mid_caps = [m for m in re.finditer(r"\b" + re.escape(w) + r"\b", subs_text)
+                    if m.start() > 1 and not re.search(r"[.!?…]\s+$", subs_text[:m.start()])]
+        if len(mid_caps) < 2:  # one-off mid-sentence cap is too weak a signal
+            continue
+        # multiword-brand fragment filter: "Deep" in "Deep Seek" — if the candidate is
+        # usually followed by another capitalized word, it's a name fragment, not a term
+        followed_cap = sum(1 for m in re.finditer(r"\b" + re.escape(w) + r"\b", subs_text)
+                           if re.match(r"\s+[A-Z]", subs_text[m.end():]))
+        if followed_cap * 2 >= n:
+            continue
+        hit = None
+        if lw in draft_lows and w not in draft_words:
+            dv = draft_low_map[lw]
+            if dv.islower():
+                hit = dv                     # draft has it fully lowercased -> fix case
+            # draft already carries a capitalized variant (DeepSeek): trust it, skip
+        elif lw not in draft_lows:
+            close = difflib.get_close_matches(lw, draft_lows, n=1, cutoff=0.8)
+            if close:
+                hit = draft_low_map[close[0]]  # likely mishearing of this subs word
+        if hit and hit != w:
+            terms.append(w)
+            seen.add(lw)
+    return terms
+
+
+def build_corrector_prompts(canonical: list[str], sub_ref: str) -> tuple[str, str]:
+    canon_str = ", ".join(canonical)
+    system = (
+        "You are correcting a speech-to-text transcript. You are given TWO imperfect machine "
+        "transcripts of the same audio:\n"
+        "1. BASE TRANSCRIPT (Whisper, local model) — the base text. Its word stream, word order "
+        "and structure are authoritative.\n"
+    )
+    if sub_ref:
+        system += (
+            "2. ALT-TRANSCRIPT (auto-captions downloaded from the internet) — a SECOND OPINION from "
+            "another recognizer, NOT a reference and NOT necessarily accurate. It has its own "
+            "systematic errors (numbers often mangled, words dropped or merged). Never trust it "
+            "over the base without a knowledge-based reason.\n"
+        )
+    system += (
+        "The user message may also list LOW-CONFIDENCE BASE SPANS — places where Whisper itself "
+        "reported uncertainty; these are the prime suspects for mishearings, check them first "
+        "against the alt-transcript and your own knowledge. Every base span NOT listed there was "
+        "recognized by Whisper with high confidence.\n"
+        "Decide each divergence on its merits: if your own knowledge (technical terms, brands, "
+        "product names, version numbers) tells you the correct form — use it. Where knowledge "
+        "does not help and Whisper was confident about the span — prefer the base.\n"
+        "Fix ONLY clear mishearings and wrong spellings/casing of terms"
+        + (", including this canonical list: " + canon_str + ". " if canon_str else ". ")
+        + "WHEN IN DOUBT, KEEP THE BASE TEXT UNCHANGED.\n"
+        "Rules: (1) The base word stream is preserved: replace words in place; never add, drop, "
+        "merge or reorder words. (2) Do NOT rephrase or restyle. (3) Do NOT change punctuation or "
+        "grammar. (4) Numbers: keep the base transcript's numeric forms exactly; never convert "
+        "between words and digits. (5) Output ONLY the corrected base text, no comments."
+    )
+    return system, sub_ref
+
+
+def numeric_tokens(s: str) -> list[str]:
+    """All digit runs incl. separated forms ($3.12 -> ['3.12']); used to guarantee the
+    LLM never alters numbers regardless of what the prompt says."""
+    return re.findall(r"\d+(?:[.,:]\d+)*", s)
+
+
+LOGPROB_LOW = -0.7  # avg_logprob below this = Whisper itself was unsure about the segment
+
+
+def uncertain_spans(chunk: list, max_spans: int = 40) -> list[str]:
+    return [s["text"] for s in chunk
+            if s.get("logprob") is not None and s["logprob"] < LOGPROB_LOW][:max_spans]
+
+
+def verify_llm_out(pre_text: str, out: str) -> list | None:
+    """Acceptance gate. Allows replace opcodes of any span (number merges like
+    'V four point five' -> 'V 4.5' are legitimate) plus tiny insert/delete wiggle;
+    rejects on large drift. Returns change list or None."""
+    rw, ow = pre_text.split(), out.split()
+    budget = min(10, max(2, len(rw) // 100))
+    if abs(len(rw) - len(ow)) > budget:
+        return None
+    sm = difflib.SequenceMatcher(None, rw, ow)
+    ops = sm.get_opcodes()
+    id_total = 0
+    for tag, i1, i2, j1, j2 in ops:
+        if tag in ("insert", "delete"):
+            run = max(i2 - i1, j2 - j1)
+            if run > 3:            # single run of >3 inserted/deleted words = hallucination
+                return None
+            id_total += run
+    if id_total > budget:
+        return None
+    return [(" ".join(rw[i1:i2]), " ".join(ow[j1:j2]))
+            for tag, i1, i2, j1, j2 in ops if tag != "equal"]
+
+
+def correct_stage(segments: list, canonical: list[str], cfg: tuple,
+                  sub_cues: list | None = None) -> tuple[list, list, list]:
     """Term spelling correction: regex prepass (guaranteed) + LLM for the rest.
-    Retries each chunk once on LLM error. Returns (segments, change_log, errors)."""
+    Primary path: ONE call for the whole transcript (<=WHOLE_MAX_WORDS words) — consistent
+    term casing across the document. On LLM error or failed strict verification, falls back
+    to parallel ~1200-word chunks. Returns (segments, change_log, errors)."""
     chunks = build_chunks(segments)
     seg_fixed = [None] * len(segments)
     log, errors = [], []
@@ -244,49 +421,78 @@ def correct_stage(segments: list, canonical: list[str], key: str) -> tuple[list,
         seg_idx_ranges.append((pos, pos + len(chunk)))
         pos += len(chunk)
 
-    def do_chunk(ci: int):
-        lo, hi = seg_idx_ranges[ci]
-        chunk = segments[lo:hi]
+    def redistribute(chunk, text: str) -> list[str]:
+        outw = text.split()
+        fixed, wpos = [], 0
+        for s in chunk:
+            n = len(s["text"].split())
+            fixed.append(" ".join(outw[wpos:wpos + n]))
+            wpos += n
+        return fixed
+
+    def llm_correct(chunk, sub_ref: str, label: str):
+        """Returns (fixed_texts, changes, error). regex prepass always applied."""
         raw_text = " ".join(s["text"] for s in chunk)
-        # deterministic pass first (guaranteed fixes)
         pre_text, pre_rules = regex_prepass(raw_text)
         for rule, n in pre_rules:
             log.append((rule, f"×{n} (regex, гарантированно)"))
-        pre_words = len(pre_text.split())
-
-        def redistribute(text: str) -> list[str]:
-            outw = text.split()
-            fixed, wpos = [], 0
-            for s in chunk:
-                n = len(s["text"].split())
-                fixed.append(" ".join(outw[wpos:wpos + n]))
-                wpos += n
-            return fixed
-
-        if not canonical:  # no LLM terms: regex pass is all we need
-            return ci, redistribute(pre_text), [], None
-
-        canon_str = ", ".join(canonical)
-        system = (
-            "You are a transcript spelling corrector. Fix ONLY technical term spellings AND capitalization "
-            "per this canonical list: " + canon_str + ". "
-            "IMPORTANT: also fix CAPITALIZATION of listed terms wherever they appear. "
-            "Rules: (1) Change ONLY terms from the list (spelling or casing). "
-            "(2) Do NOT rephrase, add, remove, or reorder any other words. "
-            "(3) Do NOT change punctuation or grammar. "
-            "(4) Output ONLY the corrected text, no comments."
-        )
+        if not canonical and not sub_ref:
+            return redistribute(chunk, pre_text), [], None
+        system, sub_ref = build_corrector_prompts(canonical, sub_ref)
+        parts = []
+        if sub_ref:
+            parts.append("ALT-TRANSCRIPT (second opinion, error-prone):\n" + sub_ref)
+        spans = uncertain_spans(chunk)
+        if spans:
+            parts.append("LOW-CONFIDENCE BASE SPANS (Whisper unsure, check first):\n"
+                         + "\n".join("- " + t for t in spans))
+        parts.append("BASE TRANSCRIPT TO CORRECT (output only this, corrected):\n" + pre_text)
+        user_msg = "\n\n".join(parts)
         try:
-            out = glm_call(system, pre_text, key)
+            out = llm_call(system, user_msg, cfg)
         except Exception as e:
-            return ci, redistribute(pre_text), [], f"chunk {ci+1}/{len(chunks)}: LLM error ({type(e).__name__}); regex-only"
-        if abs(len(out.split()) - pre_words) > 2:
-            return ci, redistribute(pre_text), [], f"chunk {ci+1}/{len(chunks)}: word parity {pre_words}->{len(out.split())}; regex-only"
-        rw, ow = pre_text.split(), out.split()
-        sm = difflib.SequenceMatcher(None, rw, ow)
-        changes = [(" ".join(rw[i1:i2]), " ".join(ow[j1:j2]))
-                   for tag, i1, i2, j1, j2 in sm.get_opcodes() if tag != "equal"]
-        return ci, redistribute(out), changes, None
+            return redistribute(chunk, pre_text), [], f"{label}: LLM error ({type(e).__name__}); regex-only"
+        changes = verify_llm_out(pre_text, out)
+        if changes is None:
+            return redistribute(chunk, pre_text), [], f"{label}: strict verify failed (word count/insert-delete); regex-only"
+        # deterministic numeric guard: revert any change that alters digit tokens
+        # ($3.12->$312, words->$3.60 etc.) — prompts are advisory, this is enforced
+        kept = []
+        for a, b in changes:
+            if numeric_tokens(a) != numeric_tokens(b):
+                if b in out:
+                    out = out.replace(b, a, 1)
+                log.append((a, f"{b} (ОТКЛОНЕНО: числа)"))
+                continue
+            kept.append((a, b))
+        return redistribute(chunk, out), kept, None
+
+    total_words = sum(len(s["text"].split()) for s in segments)
+
+    # --- primary path: whole transcript in one call ---
+    if total_words <= WHOLE_MAX_WORDS and (canonical or sub_cues):
+        log_mark = len(log)  # regex rules logged inside llm_correct; drop them on fallback
+        sub_ref = subs_for_range(sub_cues, 0, float("inf"), SUBS_WHOLE_WORDS) if sub_cues else ""
+        fixed, changes, err = llm_correct(segments, sub_ref, "whole")
+        if err is None:
+            out_segments = []
+            for s, fx in zip(segments, fixed):
+                s2 = dict(s)
+                s2["text"] = fx
+                out_segments.append(s2)
+            log.extend(changes)
+            print(f"      режим: целиком, один вызов ({total_words} слов)", flush=True)
+            return out_segments, log, errors
+        del log[log_mark:]
+        errors.append(err + " -> fallback to chunks")
+
+    # --- fallback path: parallel chunks ---
+    def do_chunk(ci: int):
+        lo, hi = seg_idx_ranges[ci]
+        chunk = segments[lo:hi]
+        sub_ref = subs_for_range(sub_cues, chunk[0]["start"], chunk[-1]["end"]) if sub_cues else ""
+        fixed, changes, err = llm_correct(chunk, sub_ref, f"chunk {ci+1}/{len(chunks)}")
+        return ci, fixed, changes, err
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
         for fut in concurrent.futures.as_completed([ex.submit(do_chunk, i) for i in range(len(chunks))]):
@@ -398,23 +604,42 @@ def process_one(src: pathlib.Path, args):
     draft_words = sum(len(s["text"].split()) for s in segments)
     print(f"      {stt_info['sent']} сегментов, {draft_words} слов — {t_stt:.0f}с", flush=True)
 
-    key = read_glm_key()
+    cfg = read_llm_config()
     change_log, llm_errors, canonical = [], [], []
+    sub_cues = None
+    if args.subs:
+        sp = pathlib.Path(args.subs).expanduser()
+        if sp.exists():
+            sub_cues = parse_subs(sp)
+            print(f"      субтитры: {sp.name} — {len(sub_cues)} реплик", flush=True)
+            if not sub_cues:
+                sub_cues = None
+                llm_errors.append(f"subs file {sp.name} parsed to 0 cues; ignored")
+        else:
+            llm_errors.append(f"subs file not found: {sp}; ignored")
 
     if args.no_llm:
         print("[3/3] LLM-коррекция пропущена (--no-llm)", flush=True)
         fix_segment_junctions(segments)
-    elif key is None:
-        llm_errors.append("GLM_API_KEY not found in ~/.hermes/.env; LLM correction skipped")
+    elif cfg is None:
+        llm_errors.append("DEEPSEEK_API_KEY not found in ~/.hermes/.env; LLM correction skipped")
         print("[3/3] LLM-коррекция: нет ключа — пропуск", flush=True)
         fix_segment_junctions(segments)
     else:
         draft_text = " ".join(s["text"] for s in segments)
         canonical = extract_canonical(draft_text, [t.strip() for t in args.terms.split(",") if t.strip()])
-        if canonical:
+        if sub_cues:
+            auto = [t for t in extract_terms_from_subs(sub_cues, draft_text) if t not in canonical]
+            if auto:
+                canonical += auto
+                print(f"      авто-термины из субтитров ({len(auto)}): {', '.join(auto)}", flush=True)
+        if canonical or sub_cues:
             t2 = time.time()
-            print(f"[3/3] LLM-коррекция: канонов {len(canonical)}: {', '.join(canonical)}", flush=True)
-            segments, change_log, llm_errors = correct_stage(segments, canonical, key)
+            src_note = " + субтитры-референс" if sub_cues else ""
+            print(f"[3/3] LLM-коррекция: канонов {len(canonical)}{src_note}"
+                  + (f": {', '.join(canonical)}" if canonical else ""), flush=True)
+            segments, change_log, llm_errors2 = correct_stage(segments, canonical, cfg, sub_cues)
+            llm_errors.extend(llm_errors2)
             t_llm = time.time() - t2
             print(f"      правок {len(change_log)} — {t_llm:.0f}с", flush=True)
         else:
@@ -425,13 +650,16 @@ def process_one(src: pathlib.Path, args):
     out = OUT_DIR / f"{datetime.date.today().isoformat()}_{stem}.md"
 
     llm_line = "выключена (--no-llm)" if args.no_llm else (
-        f"glm-5.3-flash (reasoning_effort=low); канонов {len(canonical)}, правок {len(change_log)}, {t_llm:.0f}с"
-        if (canonical or change_log) else "не потребовалась (терминов не найдено)")
+        f"{LLM_MODEL} (reasoning_effort=low); канонов {len(canonical)}, правок {len(change_log)}, {t_llm:.0f}с"
+        if (canonical or change_log or sub_cues) else "не потребовалась (терминов не найдено)")
+    subs_line = (f"`{args.subs}` ({len(sub_cues)} реплик) — референс LLM-коррекции"
+                 if sub_cues else "не использовались")
 
     lines = [
         f"# Транскрипция — {src.name}", "",
         f"- **Дата:** {datetime.date.today().isoformat()}",
         f"- **Источник:** `{src}`",
+        f"- **Субтитры:** {subs_line}",
         f"- **Длительность:** {fmt_ts(vad['duration'])} | речь (VAD): {speech_s/60:.1f} мин ({vad['speech_ratio']*100:.0f}%)",
         f"- **Модель:** {pathlib.Path(args.model).name}, язык: {args.language}, VAD: Silero",
         f"- **LLM-коррекция:** {llm_line}",
@@ -451,7 +679,7 @@ def process_one(src: pathlib.Path, args):
     if args.save_corrections and change_log:
         cpath = out.with_suffix(".corrections.md")
         clines = [f"# LLM-правки — {src.name}", "",
-                  f"Модель: glm-5.3-flash (reasoning_effort=low), канон-терминов: {len(canonical)}. "
+                  f"Модель: {LLM_MODEL} (reasoning_effort=low), канон-терминов: {len(canonical)}. "
                   "Каждая правка проверена word-diff'ом; чанки с ошибкой оставлены без правок.", ""]
         for a, b in change_log:
             clines.append(f"- `{a}` → `{b}`")
@@ -472,6 +700,7 @@ def main():
     ap.add_argument("--language", default="ru")
     ap.add_argument("--model", default=DEFAULT_MODEL)
     ap.add_argument("--terms", default="", help="extra canonical terms, comma-separated")
+    ap.add_argument("--subs", default="", help="subtitle file (srt/vtt) as LLM-correction reference")
     ap.add_argument("--no-llm", action="store_true", help="skip LLM correction (regex prepass only)")
     ap.add_argument("--save-corrections", action="store_true", help="save corrections sidecar (default: off)")
     ap.add_argument("--debug-segments", action="store_true", help="save raw segments JSON sidecar")
