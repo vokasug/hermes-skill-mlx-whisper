@@ -155,6 +155,8 @@ mlx_whisper --model ~/.local/share/models/whisper-podlodka-turbo-MLX-q8 \
 
 ## Verification
 
+0. Офлайн-тесты LLM-гейтов (без API, llm_call подменён): `~/.local/share/uv/tools/mlx-whisper/bin/python ~/.hermes/skills/media/mlx-whisper/tests/test_llm_gates.py` → `ALL TESTS OK`. Прогонять после любой правки correct_stage/verify_llm_out/числового гейта/redistribute.
+
 1. Скрипт напечатал `OK /Users/alexander/result-mlx-whisper/YYYY-MM-DD_<имя>.md`; файл существует и непустой (`read_file`): заголовок с метаданными, текст, таблица сегментов.
 2. Имя файла начинается с сегодняшней даты `YYYY-MM-DD_`.
 3. Процесс завершился: `pgrep -fl mlx_whisper` пуст — модель выгружена из RAM (норма CLI-процесса).

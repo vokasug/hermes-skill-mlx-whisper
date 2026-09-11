@@ -414,6 +414,12 @@ def correct_stage(segments: list, canonical: list[str], cfg: tuple,
             n = len(s["text"].split())
             fixed.append(" ".join(outw[wpos:wpos + n]))
             wpos += n
+        if fixed and wpos < len(outw):
+            # LLM вернул больше слов, чем во входе (verify-бюджет это разрешает): хвост
+            # приписываем к последнему сегменту куска, а не отбрасываем молча
+            extra = len(outw) - wpos
+            fixed[-1] = (fixed[-1] + " " + " ".join(outw[wpos:])).strip()
+            log.append((f"+{extra} слов", "вывод длиннее входа — хвост приписан к концу куска"))
         return fixed
 
     def llm_correct(chunk, sub_ref: str, label: str):
