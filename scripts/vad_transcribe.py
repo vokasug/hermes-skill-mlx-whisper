@@ -7,8 +7,10 @@ Run with the mlx-whisper uv tool python:
 Stages:
   1. VAD   (silero venv + onnx model)          -> speech intervals
   2. STT   (segments <=28s, one process, condition_on_previous_text=False)
-  3. LLM   (deepseek-flash, reasoning_effort=low) -> term spelling correction (whole transcript;
-           10 parallel, word-diff verified per chunk; failed chunk keeps regex-only result)
+  3. LLM   (deepseek-flash, reasoning_effort=low) -> term spelling correction. One call for
+           the whole transcript up to WHOLE_MAX_WORDS; larger transcripts are halved recursively
+           (halves in parallel). A piece failing the LLM call or word-diff verification is halved
+           again; a single failing segment keeps its regex-only result.
 
 Rendering: transcript is cut into sentences (by terminal punctuation of the word stream), then
 sentences are grouped into ~60 s blocks — a new block starts at the sentence boundary nearest to
@@ -45,8 +47,6 @@ LLM_MODEL = "deepseek-flash"   # DeepSeek V4.1-Flash; thinking on, reasoning_eff
 MAX_SEG = 28.0
 GAP_MERGE = 0.25
 PAD = 0.15
-CHUNK_WORDS = 1200
-MAX_WORKERS = 10
 PARA_TARGET_S = 60.0  # block target: a new block starts at the sentence boundary nearest to +60s
 
 # Built-in mishear -> canonical map (source-2 term extraction from the draft).
@@ -176,19 +176,6 @@ def fix_segment_junctions(segments: list) -> None:
             segments[i + 1]["text"] = b.replace(first_w, first_w[:1].lower() + first_w[1:], 1)
 
 
-def build_chunks(segments: list, target_words: int = CHUNK_WORDS) -> list[list]:
-    chunks, cur, words = [], [], 0
-    for seg in segments:
-        cur.append(seg)
-        words += len(seg["text"].split())
-        if words >= target_words:
-            chunks.append(cur)
-            cur, words = [], 0
-    if cur:
-        chunks.append(cur)
-    return chunks
-
-
 def llm_call(system: str, user: str, cfg: tuple[str, str], attempts: int = 2) -> str:
     """DeepSeek chat completion (deepseek-flash, reasoning_effort=low; temperature is a
     no-op while thinking is on — kept for compat). Short timeout + bounded retries:
@@ -197,7 +184,7 @@ def llm_call(system: str, user: str, cfg: tuple[str, str], attempts: int = 2) ->
     body = {"model": LLM_MODEL,
             "messages": [{"role": "system", "content": system},
                          {"role": "user", "content": user}],
-            "temperature": 0.1, "max_tokens": 65536, "reasoning_effort": "low"}
+            "temperature": 0.1, "max_tokens": 131072, "reasoning_effort": "low"}
     last_exc = None
     for attempt in range(attempts):
         req = urllib.request.Request(
@@ -281,8 +268,9 @@ def subs_for_range(cues: list, t0: float, t1: float, max_words: int = 700) -> st
     return " ".join(out)
 
 
-WHOLE_MAX_WORDS = 8000     # <= this many words: correct the whole transcript in ONE LLM call
-SUBS_WHOLE_WORDS = 20000   # subtitle reference cap for a whole-transcript call
+WHOLE_MAX_WORDS = 10000    # <= this many words: one LLM call; larger transcripts are halved
+                           # recursively (measured 2026-09-11: 14826 words = 45.6k completion
+                           # tokens of the 131072 cap, finish=stop, verify ok)
 
 
 def extract_terms_from_subs(sub_cues: list, draft_text: str, max_terms: int = 25) -> list[str]:
@@ -384,10 +372,10 @@ def uncertain_spans(chunk: list, max_spans: int = 40) -> list[str]:
             if s.get("logprob") is not None and s["logprob"] < LOGPROB_LOW][:max_spans]
 
 
-def verify_llm_out(pre_text: str, out: str) -> list | None:
+def verify_llm_out(pre_text: str, out: str) -> tuple | None:
     """Acceptance gate. Allows replace opcodes of any span (number merges like
     'V four point five' -> 'V 4.5' are legitimate) plus tiny insert/delete wiggle;
-    rejects on large drift. Returns change list or None."""
+    rejects on large drift. Returns (opcodes, base_words, out_words) or None."""
     rw, ow = pre_text.split(), out.split()
     budget = min(10, max(2, len(rw) // 100))
     if abs(len(rw) - len(ow)) > budget:
@@ -403,23 +391,21 @@ def verify_llm_out(pre_text: str, out: str) -> list | None:
             id_total += run
     if id_total > budget:
         return None
-    return [(" ".join(rw[i1:i2]), " ".join(ow[j1:j2]))
-            for tag, i1, i2, j1, j2 in ops if tag != "equal"]
+    return ops, rw, ow
 
 
 def correct_stage(segments: list, canonical: list[str], cfg: tuple,
                   sub_cues: list | None = None) -> tuple[list, list, list]:
     """Term spelling correction: regex prepass (guaranteed) + LLM for the rest.
-    Primary path: ONE call for the whole transcript (<=WHOLE_MAX_WORDS words) — consistent
-    term casing across the document. On LLM error or failed strict verification, falls back
-    to parallel ~1200-word chunks. Returns (segments, change_log, errors)."""
-    chunks = build_chunks(segments)
-    seg_fixed = [None] * len(segments)
+    A piece of <=WHOLE_MAX_WORDS words is corrected in ONE call — consistent term casing
+    across it. Larger pieces are halved recursively (halves run in parallel, each half is
+    re-checked against the limit). A piece that fails the LLM call or strict verification
+    is halved again; a single failing segment keeps its regex-only result. There is no
+    fixed small-chunk fallback: halving keeps pieces as large as possible, which preserves
+    cross-piece term consistency and costs ~4-5x fewer completion tokens than 1200-word
+    chunking (measured 2026-09-11). Returns (segments, change_log, errors)."""
     log, errors = [], []
-    seg_idx_ranges, pos = [], 0
-    for chunk in chunks:
-        seg_idx_ranges.append((pos, pos + len(chunk)))
-        pos += len(chunk)
+    seg_fixed: list = [None] * len(segments)
 
     def redistribute(chunk, text: str) -> list[str]:
         outw = text.split()
@@ -452,58 +438,73 @@ def correct_stage(segments: list, canonical: list[str], cfg: tuple,
             out = llm_call(system, user_msg, cfg)
         except Exception as e:
             return redistribute(chunk, pre_text), [], f"{label}: LLM error ({type(e).__name__}); regex-only"
-        changes = verify_llm_out(pre_text, out)
-        if changes is None:
+        ver = verify_llm_out(pre_text, out)
+        if ver is None:
             return redistribute(chunk, pre_text), [], f"{label}: strict verify failed (word count/insert-delete); regex-only"
-        # deterministic numeric guard: revert any change that alters digit tokens
-        # ($3.12->$312, words->$3.60 etc.) — prompts are advisory, this is enforced
-        kept = []
-        for a, b in changes:
+        # deterministic numeric guard, POSITIONAL: rebuild the output from opcodes,
+        # taking base words for any opcode whose digit tokens differ ($3.12->$312,
+        # words->$3.60, digit-bearing deletions). Prompts are advisory, this is enforced.
+        # (Previously done via out.replace(b, a, 1): reverted the FIRST occurrence of b
+        # anywhere in the text and corrupted the output on delete opcodes where b == "".)
+        ops, rw, ow = ver
+        final, kept = [], []
+        for tag, i1, i2, j1, j2 in ops:
+            if tag == "equal":
+                final.extend(ow[j1:j2])
+                continue
+            a, b = " ".join(rw[i1:i2]), " ".join(ow[j1:j2])
             if numeric_tokens(a) != numeric_tokens(b):
-                if b in out:
-                    out = out.replace(b, a, 1)
+                final.extend(rw[i1:i2])
                 log.append((a, f"{b} (ОТКЛОНЕНО: числа)"))
-                continue
-            kept.append((a, b))
-        return redistribute(chunk, out), kept, None
+            else:
+                final.extend(ow[j1:j2])
+                kept.append((a, b))
+        return redistribute(chunk, " ".join(final)), kept, None
 
-    total_words = sum(len(s["text"].split()) for s in segments)
+    def word_count(idxs) -> int:
+        return sum(len(segments[i]["text"].split()) for i in idxs)
 
-    # --- primary path: whole transcript in one call ---
-    if total_words <= WHOLE_MAX_WORDS and (canonical or sub_cues):
-        log_mark = len(log)  # regex rules logged inside llm_correct; drop them on fallback
-        sub_ref = subs_for_range(sub_cues, 0, float("inf"), SUBS_WHOLE_WORDS) if sub_cues else ""
-        fixed, changes, err = llm_correct(segments, sub_ref, "whole")
-        if err is None:
-            out_segments = []
-            for s, fx in zip(segments, fixed):
-                s2 = dict(s)
-                s2["text"] = fx
-                out_segments.append(s2)
-            log.extend(changes)
-            print(f"      режим: целиком, один вызов ({total_words} слов)", flush=True)
-            return out_segments, log, errors
-        del log[log_mark:]
-        errors.append(err + " -> fallback to chunks")
+    def split_half(idxs) -> tuple[list, list]:
+        """Split segment index list into two halves by word count (both non-empty)."""
+        half_words, acc, cut = word_count(idxs) / 2, 0, len(idxs) // 2
+        for k, i in enumerate(idxs):
+            acc += len(segments[i]["text"].split())
+            if acc >= half_words:
+                cut = k + 1
+                break
+        cut = min(max(cut, 1), len(idxs) - 1)
+        return idxs[:cut], idxs[cut:]
 
-    # --- fallback path: parallel chunks ---
-    def do_chunk(ci: int):
-        lo, hi = seg_idx_ranges[ci]
-        chunk = segments[lo:hi]
-        sub_ref = subs_for_range(sub_cues, chunk[0]["start"], chunk[-1]["end"]) if sub_cues else ""
-        fixed, changes, err = llm_correct(chunk, sub_ref, f"chunk {ci+1}/{len(chunks)}")
-        return ci, fixed, changes, err
+    def process(idxs, label: str):
+        """Correct segments[idxs]; returns error string or None. Halves on overflow/failure."""
+        if word_count(idxs) <= WHOLE_MAX_WORDS or len(idxs) == 1:
+            chunk = [segments[i] for i in idxs]
+            # subs reference scaled to piece size (was a flat 700-word cap / 20000 whole)
+            max_sub_words = max(700, int(word_count(idxs) * 1.2))
+            sub_ref = (subs_for_range(sub_cues, chunk[0]["start"], chunk[-1]["end"],
+                                      max_sub_words) if sub_cues else "")
+            fixed, changes, err = llm_correct(chunk, sub_ref, label)
+            if err is None or len(idxs) == 1:
+                for k, i in enumerate(idxs):
+                    seg_fixed[i] = fixed[k]
+                if err is None:
+                    log.extend(changes)
+                return err
+            errors.append(err + " -> halving")
+        a, b = split_half(idxs)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
+            results = list(ex.map(lambda p: process(*p),
+                                  [(a, label + "a"), (b, label + "b")]))
+        errs = [e for e in results if e]
+        return "; ".join(errs) if errs else None
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        for fut in concurrent.futures.as_completed([ex.submit(do_chunk, i) for i in range(len(chunks))]):
-            ci, fixed, changes, err = fut.result()
-            if err:
-                errors.append(err)
-                continue
-            lo, hi = seg_idx_ranges[ci]
-            for k, si in enumerate(range(lo, hi)):
-                seg_fixed[si] = fixed[k]
-            log.extend(changes)
+    total_words = word_count(list(range(len(segments))))
+    err = process(list(range(len(segments))), "whole")
+    if err:
+        errors.append(err)
+    mode = ("целиком, один вызов" if total_words <= WHOLE_MAX_WORDS
+            else "рекурсивное уполовинивание")
+    print(f"      режим: {mode} ({total_words} слов)", flush=True)
 
     out_segments = []
     for s, fx in zip(segments, seg_fixed):
