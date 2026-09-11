@@ -42,7 +42,46 @@ VAD_MODEL = HOME / ".local/share/models/silero-vad/silero_vad.onnx"
 DEFAULT_MODEL = str(HOME / ".local/share/models/whisper-podlodka-turbo-MLX-q8")
 OUT_DIR = pathlib.Path("/Users/alexander/result-mlx-whisper")
 ENV_FILE = HOME / ".hermes/.env"
-LLM_MODEL = "deepseek-flash"   # DeepSeek V4.1-Flash; thinking on, reasoning_effort=low
+LLM_MODEL = "deepseek-flash"   # fallback default (DeepSeek V4.1-Flash; thinking on, reasoning_effort=low)
+
+# Language-routed corrector (measured 2026-09-11: 3 runs per cell, two videos, same raw input):
+#   en -> glm-5.3-flash (z.ai): stable core 116 fixes vs deepseek's 45; catches Soul/cache/Tibo
+#         on every run (deepseek never caught Tibo and actively broke Soul->Sol on one run).
+#   ru -> deepseek-flash: catches Wildberries/Телеграме on every run (GLM never did); GLM drifts
+#         into rephrasing on Russian at any reasoning level (tested reasoning_effort=low and
+#         full thinking). GLM-en quirks: follows subtitle typos (atvive.link, BB1 corpus).
+# Env overrides: CORRECT_MODEL_<LANG> (e.g. CORRECT_MODEL_EN). Keys: GLM_API_KEY (+GLM_BASE_URL),
+# DEEPSEEK_API_KEY (+DEEPSEEK_BASE_URL). Routed provider without a key -> the other provider;
+# none -> LLM stage skipped honestly.
+LLM_PROVIDERS = {
+    "glm": ("GLM_API_KEY", "GLM_BASE_URL", "https://api.z.ai/api/paas/v4", "glm-5.3-flash"),
+    "deepseek": ("DEEPSEEK_API_KEY", "DEEPSEEK_BASE_URL", "https://api.deepseek.com", LLM_MODEL),
+}
+LLM_ROUTE = {"en": "glm"}   # every other language defaults to deepseek
+
+
+def read_llm_config(lang: str = "") -> tuple[str, str, str] | None:
+    """Corrector (key, url, model) for the transcript language, from ~/.hermes/.env.
+    Routing via LLM_ROUTE with per-language CORRECT_MODEL_<LANG> override; falls back to
+    the other provider if the routed one has no key. None when no provider key exists."""
+    if not ENV_FILE.exists():
+        return None
+    env = {}
+    for line in ENV_FILE.read_text().splitlines():
+        line = line.strip()
+        if "=" in line and not line.startswith("#"):
+            k, v = line.split("=", 1)
+            env[k.strip()] = v.strip().strip('"').strip("'")
+    order = [LLM_ROUTE.get(lang, "deepseek")]
+    order += [p for p in LLM_PROVIDERS if p not in order]
+    for pname in order:
+        key_env, url_env, default_url, default_model = LLM_PROVIDERS[pname]
+        if not env.get(key_env):
+            continue
+        model = env.get(f"CORRECT_MODEL_{lang.upper()}") or default_model
+        url = (env.get(url_env) or default_url).rstrip("/") + "/chat/completions"
+        return env[key_env], url, model
+    return None
 
 MAX_SEG = 28.0
 GAP_MERGE = 0.25
@@ -69,21 +108,6 @@ LOWER_STARTERS = {
     "и", "а", "но", "что", "это", "он", "она", "мы", "вы", "они", "когда", "если",
     "как", "в", "на", "с", "для", "к", "по", "у", "за", "от", "там", "тут", "ещё", "тоже",
 }
-
-
-def read_llm_config() -> tuple[str, str] | None:
-    """DeepSeek key + base URL from ~/.hermes/.env."""
-    if not ENV_FILE.exists():
-        return None
-    key = base = None
-    for line in ENV_FILE.read_text().splitlines():
-        if line.startswith("DEEPSEEK_API_KEY="):
-            key = line.split("=", 1)[1].strip() or None
-        elif line.startswith("DEEPSEEK_BASE_URL="):
-            base = line.split("=", 1)[1].strip() or None
-    if not key:
-        return None
-    return key, (base or "https://api.deepseek.com") + "/chat/completions"
 
 
 def fmt_ts(sec) -> str:
@@ -182,13 +206,13 @@ class TruncatedError(RuntimeError):
     halves the piece instead. Network/HTTP errors below are still retried."""
 
 
-def llm_call(system: str, user: str, cfg: tuple[str, str], attempts: int = 2) -> str:
-    """DeepSeek chat completion (deepseek-flash, reasoning_effort=low; temperature is a
-    no-op while thinking is on — kept for compat). Short timeout + bounded retries:
-    a hung/dropped call must never stall the pipeline. Truncation raises TruncatedError
-    immediately (no retry — same size truncates again)."""
-    key, url = cfg
-    body = {"model": LLM_MODEL,
+def llm_call(system: str, user: str, cfg: tuple[str, str, str], attempts: int = 2) -> str:
+    """Chat completion for the corrector (reasoning_effort=low; temperature is a no-op
+    while thinking is on — kept for compat). cfg = (api_key, chat_completions_url, model).
+    Short timeout + bounded retries: a hung/dropped call must never stall the pipeline.
+    Truncation raises TruncatedError immediately (no retry — same size truncates again)."""
+    key, url, model = cfg
+    body = {"model": model,
             "messages": [{"role": "system", "content": system},
                          {"role": "user", "content": user}],
             "temperature": 0.1, "max_tokens": 131072, "reasoning_effort": "low"}
@@ -622,7 +646,8 @@ def process_one(src: pathlib.Path, args):
     draft_words = sum(len(s["text"].split()) for s in segments)
     print(f"      {stt_info['sent']} сегментов, {draft_words} слов — {t_stt:.0f}с", flush=True)
 
-    cfg = read_llm_config()
+    cfg = read_llm_config(args.language)
+    llm_model = cfg[2] if cfg else LLM_MODEL
     change_log, llm_errors, canonical = [], [], []
     sub_cues = None
     if args.subs:
@@ -640,7 +665,7 @@ def process_one(src: pathlib.Path, args):
         print("[3/3] LLM-коррекция пропущена (--no-llm)", flush=True)
         fix_segment_junctions(segments)
     elif cfg is None:
-        llm_errors.append("DEEPSEEK_API_KEY not found in ~/.hermes/.env; LLM correction skipped")
+        llm_errors.append("no corrector key (DEEPSEEK_API_KEY/GLM_API_KEY) in ~/.hermes/.env; LLM correction skipped")
         print("[3/3] LLM-коррекция: нет ключа — пропуск", flush=True)
         fix_segment_junctions(segments)
     else:
@@ -654,7 +679,7 @@ def process_one(src: pathlib.Path, args):
         if canonical or sub_cues:
             t2 = time.time()
             src_note = " + субтитры-референс" if sub_cues else ""
-            print(f"[3/3] LLM-коррекция: канонов {len(canonical)}{src_note}"
+            print(f"[3/3] LLM-коррекция ({llm_model}): канонов {len(canonical)}{src_note}"
                   + (f": {', '.join(canonical)}" if canonical else ""), flush=True)
             segments, change_log, llm_errors2 = correct_stage(segments, canonical, cfg, sub_cues)
             llm_errors.extend(llm_errors2)
@@ -668,7 +693,7 @@ def process_one(src: pathlib.Path, args):
     out = OUT_DIR / f"{datetime.date.today().isoformat()}_{stem}.md"
 
     llm_line = "выключена (--no-llm)" if args.no_llm else (
-        f"{LLM_MODEL} (reasoning_effort=low); канонов {len(canonical)}, правок {len(change_log)}, {t_llm:.0f}с"
+        f"{llm_model} (reasoning_effort=low); канонов {len(canonical)}, правок {len(change_log)}, {t_llm:.0f}с"
         if (canonical or change_log or sub_cues) else "не потребовалась (терминов не найдено)")
     subs_line = (f"`{args.subs}` ({len(sub_cues)} реплик) — референс LLM-коррекции"
                  if sub_cues else "не использовались")
@@ -697,7 +722,7 @@ def process_one(src: pathlib.Path, args):
     if args.save_corrections and change_log:
         cpath = out.with_suffix(".corrections.md")
         clines = [f"# LLM-правки — {src.name}", "",
-                  f"Модель: {LLM_MODEL} (reasoning_effort=low), канон-терминов: {len(canonical)}. "
+                  f"Модель: {llm_model} (reasoning_effort=low), канон-терминов: {len(canonical)}. "
                   "Каждая правка проверена word-diff'ом; чанки с ошибкой оставлены без правок.", ""]
         for a, b in change_log:
             clines.append(f"- `{a}` → `{b}`")

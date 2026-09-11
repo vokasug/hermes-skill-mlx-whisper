@@ -49,7 +49,7 @@ def run(base, out, terms=("Astra",)):
     FAKE["out"] = out
     FAKE["fn"] = None
     FAKE["calls"] = []
-    fixed, log, errors = vt.correct_stage(mk(base), list(terms), ("k", "http://x"), None)
+    fixed, log, errors = vt.correct_stage(mk(base), list(terms), ("k", "http://x", "m"), None)
     return " ".join(s["text"] for s in fixed), log, errors
 
 
@@ -89,7 +89,7 @@ try:
     def echo(user):  # вернуть базу как есть (0 правок)
         return user.rsplit("BASE TRANSCRIPT TO CORRECT (output only this, corrected):\n", 1)[1]
     FAKE["fn"] = echo
-    fixed, log, errors = vt.correct_stage(mk(base), ["Astra"], ("k", "http://x"), None)
+    fixed, log, errors = vt.correct_stage(mk(base), ["Astra"], ("k", "http://x", "m"), None)
     assert not errors, errors
     assert " ".join(s["text"] for s in fixed) == base.replace("|", " ")
     n_calls = len(FAKE["calls"])
@@ -107,7 +107,7 @@ try:
             raise RuntimeError("boom")
         return piece
     FAKE["fn"] = fail_big
-    fixed, log, errors = vt.correct_stage(mk(base), ["Astra"], ("k", "http://x"), None)
+    fixed, log, errors = vt.correct_stage(mk(base), ["Astra"], ("k", "http://x", "m"), None)
     assert " ".join(s["text"] for s in fixed) == base.replace("|", " ")
     assert any("halving" in e for e in errors), errors
 
@@ -123,7 +123,7 @@ try:
             raise RuntimeError("boom")
         return piece
     FAKE["fn"] = fail_big2
-    fixed, log, errors = vt.correct_stage(mk(base2), ["Astra"], ("k", "http://x"), None)
+    fixed, log, errors = vt.correct_stage(mk(base2), ["Astra"], ("k", "http://x", "m"), None)
     n_regex = sum(1 for a, b in log if "codex belts" in str(a) and "regex" in str(b))
     assert n_regex == 1, f"regex-правка в логе {n_regex} раз (дубли при halving): {log}"
 finally:
@@ -153,12 +153,22 @@ orig_urlopen = vt.urllib.request.urlopen
 vt.urllib.request.urlopen = fake_urlopen
 try:
     try:
-        REAL_LLM_CALL("s", "u", ("k", "http://x"))
+        REAL_LLM_CALL("s", "u", ("k", "http://x", "m"))
         raise AssertionError("ожидался TruncatedError")
     except vt.TruncatedError:
         pass
     assert http_calls["n"] == 1, f"усечённый запрос повторён {http_calls['n']} раз"
 finally:
     vt.urllib.request.urlopen = orig_urlopen
+
+# 10. роутинг по языку (боевой ~/.hermes/.env: en -> glm, ru/прочие -> deepseek)
+cfg_en = vt.read_llm_config("en")
+cfg_ru = vt.read_llm_config("ru")
+cfg_xx = vt.read_llm_config("de")
+assert cfg_en and cfg_en[2] == "glm-5.3-flash" and "z.ai" in cfg_en[1], cfg_en
+assert cfg_ru and cfg_ru[2] == "deepseek-flash" and "deepseek" in cfg_ru[1], cfg_ru
+assert cfg_xx and cfg_xx[2] == "deepseek-flash", cfg_xx
+assert cfg_en[1].endswith("/chat/completions") and cfg_ru[1].endswith("/chat/completions")
+print("case10 routing OK:", cfg_en[2], "|", cfg_ru[2])
 
 print("ALL TESTS OK")
