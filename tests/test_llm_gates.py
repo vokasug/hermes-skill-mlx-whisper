@@ -13,7 +13,11 @@
   4. галлюцинационная вставка (>3 слов подряд) -> verify FAIL -> regex-only база;
   5. вывод длиннее входа -> хвост приписывается к последнему сегменту, не теряется;
   6. транскрипт > WHOLE_MAX_WORDS -> рекурсивное уполовинивание, каждый вызов <= лимита;
-  7. кусок, проваливший LLM-вызов, делится пополам и обе половины обрабатываются.
+  7. кусок, проваливший LLM-вызов, делится пополам и обе половины обрабатываются;
+  8. finish_reason=length -> TruncatedError сразу, без повторного запроса (retry — только
+     сетевые/HTTP ошибки);
+  9. уполовинивание после ошибки не дублирует regex-правки в логе (записи провалившегося
+     куска удаляются перед делением).
 """
 import pathlib
 import sys
@@ -32,6 +36,7 @@ def fake_llm(system, user, cfg, attempts=2):
     return FAKE["out"]
 
 
+REAL_LLM_CALL = vt.llm_call  # настоящий, до подмены (нужен тесту 8)
 vt.llm_call = fake_llm
 
 
@@ -105,7 +110,55 @@ try:
     fixed, log, errors = vt.correct_stage(mk(base), ["Astra"], ("k", "http://x"), None)
     assert " ".join(s["text"] for s in fixed) == base.replace("|", " ")
     assert any("halving" in e for e in errors), errors
+
+    # 9. уполовинивание после ошибки НЕ дублирует regex-правки в логе
+    #    (правило "codex belts" живёт в одной половине -> ровно одна запись в логе)
+    base2 = "|".join(" ".join(f"w{i}" for i in range(k, k + 10)) for k in range(0, 490, 10))
+    base2 += "|codex belts happened here just now"  # 50-й сегмент, 5 слов с правилом
+    FAKE["calls"] = []
+
+    def fail_big2(user):
+        piece = user.rsplit("BASE TRANSCRIPT TO CORRECT (output only this, corrected):\n", 1)[1]
+        if len(piece.split()) > 60:
+            raise RuntimeError("boom")
+        return piece
+    FAKE["fn"] = fail_big2
+    fixed, log, errors = vt.correct_stage(mk(base2), ["Astra"], ("k", "http://x"), None)
+    n_regex = sum(1 for a, b in log if "codex belts" in str(a) and "regex" in str(b))
+    assert n_regex == 1, f"regex-правка в логе {n_regex} раз (дубли при halving): {log}"
 finally:
     vt.WHOLE_MAX_WORDS = orig_limit
+
+# 8. finish_reason=length -> TruncatedError СРАЗУ, без повторного запроса (retry только сеть)
+http_calls = {"n": 0}
+
+
+class FakeResp:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def read(self):
+        return b'{"choices": [{"finish_reason": "length", "message": {"content": "x"}}]}'
+
+
+def fake_urlopen(req, timeout=None):
+    http_calls["n"] += 1
+    return FakeResp()
+
+
+orig_urlopen = vt.urllib.request.urlopen
+vt.urllib.request.urlopen = fake_urlopen
+try:
+    try:
+        REAL_LLM_CALL("s", "u", ("k", "http://x"))
+        raise AssertionError("ожидался TruncatedError")
+    except vt.TruncatedError:
+        pass
+    assert http_calls["n"] == 1, f"усечённый запрос повторён {http_calls['n']} раз"
+finally:
+    vt.urllib.request.urlopen = orig_urlopen
 
 print("ALL TESTS OK")

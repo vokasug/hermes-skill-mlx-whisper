@@ -176,10 +176,17 @@ def fix_segment_junctions(segments: list) -> None:
             segments[i + 1]["text"] = b.replace(first_w, first_w[:1].lower() + first_w[1:], 1)
 
 
+class TruncatedError(RuntimeError):
+    """finish_reason=length. Deterministic for a given input size: retrying the SAME
+    request is a guaranteed repeat truncation (~2x cost burned for nothing) — the caller
+    halves the piece instead. Network/HTTP errors below are still retried."""
+
+
 def llm_call(system: str, user: str, cfg: tuple[str, str], attempts: int = 2) -> str:
     """DeepSeek chat completion (deepseek-flash, reasoning_effort=low; temperature is a
     no-op while thinking is on — kept for compat). Short timeout + bounded retries:
-    a hung/dropped call must never stall the pipeline."""
+    a hung/dropped call must never stall the pipeline. Truncation raises TruncatedError
+    immediately (no retry — same size truncates again)."""
     key, url = cfg
     body = {"model": LLM_MODEL,
             "messages": [{"role": "system", "content": system},
@@ -193,13 +200,14 @@ def llm_call(system: str, user: str, cfg: tuple[str, str], attempts: int = 2) ->
         try:
             with urllib.request.urlopen(req, timeout=120) as r:
                 d = json.load(r)
-            if d["choices"][0].get("finish_reason") == "length":
-                raise RuntimeError("LLM output truncated (finish_reason=length)")
-            return d["choices"][0]["message"]["content"]
         except Exception as e:
             last_exc = e
             if attempt + 1 < attempts:
                 time.sleep(3 * (attempt + 1))
+            continue
+        if d["choices"][0].get("finish_reason") == "length":
+            raise TruncatedError("LLM output truncated (finish_reason=length); halve the piece")
+        return d["choices"][0]["message"]["content"]
     raise last_exc
 
 
@@ -489,6 +497,8 @@ def correct_stage(segments: list, canonical: list[str], cfg: tuple,
             max_sub_words = max(700, int(word_count(idxs) * 1.2))
             sub_ref = (subs_for_range(sub_cues, chunk[0]["start"], chunk[-1]["end"],
                                       max_sub_words) if sub_cues else "")
+            log_mark = len(log)  # regex-prepass entries of THIS piece (llm_correct logs them
+                                 # before knowing acceptance); dropped if we fall to halving
             fixed, changes, err = llm_correct(chunk, sub_ref, label)
             if err is None or len(idxs) == 1:
                 for k, i in enumerate(idxs):
@@ -496,6 +506,7 @@ def correct_stage(segments: list, canonical: list[str], cfg: tuple,
                 if err is None:
                     log.extend(changes)
                 return err
+            del log[log_mark:]  # halves redo the regex prepass — keep the log free of duplicates
             errors.append(err + " -> halving")
         a, b = split_half(idxs)
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
