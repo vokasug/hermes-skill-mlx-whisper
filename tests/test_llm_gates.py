@@ -161,14 +161,14 @@ try:
 finally:
     vt.urllib.request.urlopen = orig_urlopen
 
-# 10. роутинг по языку (боевой ~/.hermes/.env: en -> glm, ru/прочие -> deepseek)
+# 10. корректор (боевой ~/.hermes/.env): glm-5.3-flash для всех языков
 cfg_en = vt.read_llm_config("en")
 cfg_ru = vt.read_llm_config("ru")
 cfg_xx = vt.read_llm_config("de")
 assert cfg_en and cfg_en[2] == "glm-5.3-flash" and "z.ai" in cfg_en[1], cfg_en
-assert cfg_ru and cfg_ru[2] == "deepseek-flash" and "deepseek" in cfg_ru[1], cfg_ru
-assert cfg_xx and cfg_xx[2] == "deepseek-flash", cfg_xx
+assert cfg_ru and cfg_ru[2] == "glm-5.3-flash" and "z.ai" in cfg_ru[1], cfg_ru
+assert cfg_xx and cfg_xx[2] == "glm-5.3-flash", cfg_xx
 assert cfg_en[1].endswith("/chat/completions") and cfg_ru[1].endswith("/chat/completions")
-print("case10 routing OK:", cfg_en[2], "|", cfg_ru[2])
+print("case10 corrector OK:", cfg_en[2], "|", cfg_ru[2])
 
 print("ALL TESTS OK")

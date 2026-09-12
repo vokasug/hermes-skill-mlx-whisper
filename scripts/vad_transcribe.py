@@ -7,7 +7,7 @@ Run with the mlx-whisper uv tool python:
 Stages:
   1. VAD   (silero venv + onnx model)          -> speech intervals
   2. STT   (segments <=28s, one process, condition_on_previous_text=False)
-  3. LLM   (deepseek-flash, reasoning_effort=low) -> term spelling correction. One call for
+  3. LLM   (glm-5.3-flash, reasoning_effort=low) -> term spelling correction. One call for
            the whole transcript up to WHOLE_MAX_WORDS; larger transcripts are halved recursively
            (halves in parallel). A piece failing the LLM call or word-diff verification is halved
            again; a single failing segment keeps its regex-only result.
@@ -42,28 +42,17 @@ VAD_MODEL = HOME / ".local/share/models/silero-vad/silero_vad.onnx"
 DEFAULT_MODEL = str(HOME / ".local/share/models/whisper-podlodka-turbo-MLX-q8")
 OUT_DIR = pathlib.Path("/Users/alexander/result-mlx-whisper")
 ENV_FILE = HOME / ".hermes/.env"
-LLM_MODEL = "deepseek-flash"   # fallback default (DeepSeek V4.1-Flash; thinking on, reasoning_effort=low)
+LLM_MODEL = "glm-5.3-flash"   # corrector (z.ai GLM-5.3-Flash; every language, reasoning_effort=low)
 
-# Language-routed corrector (measured 2026-09-11: 3 runs per cell, two videos, same raw input):
-#   en -> glm-5.3-flash (z.ai): stable core 116 fixes vs deepseek's 45; catches Soul/cache/Tibo
-#         on every run (deepseek never caught Tibo and actively broke Soul->Sol on one run).
-#   ru -> deepseek-flash: catches Wildberries/Телеграме on every run (GLM never did); GLM drifts
-#         into rephrasing on Russian at any reasoning level (tested reasoning_effort=low and
-#         full thinking). GLM-en quirks: follows subtitle typos (atvive.link, BB1 corpus).
-# Env overrides: CORRECT_MODEL_<LANG> (e.g. CORRECT_MODEL_EN). Keys: GLM_API_KEY (+GLM_BASE_URL),
-# DEEPSEEK_API_KEY (+DEEPSEEK_BASE_URL). Routed provider without a key -> the other provider;
-# none -> LLM stage skipped honestly.
-LLM_PROVIDERS = {
-    "glm": ("GLM_API_KEY", "GLM_BASE_URL", "https://api.z.ai/api/paas/v4", "glm-5.3-flash"),
-    "deepseek": ("DEEPSEEK_API_KEY", "DEEPSEEK_BASE_URL", "https://api.deepseek.com", LLM_MODEL),
-}
-LLM_ROUTE = {"en": "glm"}   # every other language defaults to deepseek
+# Corrector: glm-5.3-flash for every language. Key: GLM_API_KEY (+ optional GLM_BASE_URL
+# override) in ~/.hermes/.env; per-language model override CORRECT_MODEL_<LANG>
+# (e.g. CORRECT_MODEL_EN). No key -> LLM stage skipped honestly.
+GLM_URL_DEFAULT = "https://api.z.ai/api/paas/v4"
 
 
 def read_llm_config(lang: str = "") -> tuple[str, str, str] | None:
-    """Corrector (key, url, model) for the transcript language, from ~/.hermes/.env.
-    Routing via LLM_ROUTE with per-language CORRECT_MODEL_<LANG> override; falls back to
-    the other provider if the routed one has no key. None when no provider key exists."""
+    """Corrector (key, url, model) from ~/.hermes/.env; `lang` selects the optional
+    CORRECT_MODEL_<LANG> override. None when GLM_API_KEY is absent."""
     if not ENV_FILE.exists():
         return None
     env = {}
@@ -72,16 +61,12 @@ def read_llm_config(lang: str = "") -> tuple[str, str, str] | None:
         if "=" in line and not line.startswith("#"):
             k, v = line.split("=", 1)
             env[k.strip()] = v.strip().strip('"').strip("'")
-    order = [LLM_ROUTE.get(lang, "deepseek")]
-    order += [p for p in LLM_PROVIDERS if p not in order]
-    for pname in order:
-        key_env, url_env, default_url, default_model = LLM_PROVIDERS[pname]
-        if not env.get(key_env):
-            continue
-        model = env.get(f"CORRECT_MODEL_{lang.upper()}") or default_model
-        url = (env.get(url_env) or default_url).rstrip("/") + "/chat/completions"
-        return env[key_env], url, model
-    return None
+    key = env.get("GLM_API_KEY")
+    if not key:
+        return None
+    model = env.get(f"CORRECT_MODEL_{lang.upper()}") or LLM_MODEL
+    url = (env.get("GLM_BASE_URL") or GLM_URL_DEFAULT).rstrip("/") + "/chat/completions"
+    return key, url, model
 
 MAX_SEG = 28.0
 GAP_MERGE = 0.25
@@ -301,8 +286,7 @@ def subs_for_range(cues: list, t0: float, t1: float, max_words: int = 700) -> st
 
 
 WHOLE_MAX_WORDS = 10000    # <= this many words: one LLM call; larger transcripts are halved
-                           # recursively (measured 2026-09-11: 14826 words = 45.6k completion
-                           # tokens of the 131072 cap, finish=stop, verify ok)
+                           # recursively (headroom vs max_tokens=131072)
 
 
 def extract_terms_from_subs(sub_cues: list, draft_text: str, max_terms: int = 25) -> list[str]:
@@ -433,9 +417,8 @@ def correct_stage(segments: list, canonical: list[str], cfg: tuple,
     across it. Larger pieces are halved recursively (halves run in parallel, each half is
     re-checked against the limit). A piece that fails the LLM call or strict verification
     is halved again; a single failing segment keeps its regex-only result. There is no
-    fixed small-chunk fallback: halving keeps pieces as large as possible, which preserves
-    cross-piece term consistency and costs ~4-5x fewer completion tokens than 1200-word
-    chunking (measured 2026-09-11). Returns (segments, change_log, errors)."""
+    fixed small-chunk fallback: halving keeps pieces as large as possible, preserving
+    cross-piece term consistency. Returns (segments, change_log, errors)."""
     log, errors = [], []
     seg_fixed: list = [None] * len(segments)
 
@@ -482,8 +465,6 @@ def correct_stage(segments: list, canonical: list[str], cfg: tuple,
         # deterministic numeric guard, POSITIONAL: rebuild the output from opcodes,
         # taking base words for any opcode whose digit tokens differ ($3.12->$312,
         # words->$3.60, digit-bearing deletions). Prompts are advisory, this is enforced.
-        # (Previously done via out.replace(b, a, 1): reverted the FIRST occurrence of b
-        # anywhere in the text and corrupted the output on delete opcodes where b == "".)
         ops, rw, ow = ver
         final, kept = [], []
         for tag, i1, i2, j1, j2 in ops:
@@ -517,7 +498,7 @@ def correct_stage(segments: list, canonical: list[str], cfg: tuple,
         """Correct segments[idxs]; returns error string or None. Halves on overflow/failure."""
         if word_count(idxs) <= WHOLE_MAX_WORDS or len(idxs) == 1:
             chunk = [segments[i] for i in idxs]
-            # subs reference scaled to piece size (was a flat 700-word cap / 20000 whole)
+            # subs reference scaled to piece size
             max_sub_words = max(700, int(word_count(idxs) * 1.2))
             sub_ref = (subs_for_range(sub_cues, chunk[0]["start"], chunk[-1]["end"],
                                       max_sub_words) if sub_cues else "")
@@ -665,7 +646,7 @@ def process_one(src: pathlib.Path, args):
         print("[3/3] LLM-коррекция пропущена (--no-llm)", flush=True)
         fix_segment_junctions(segments)
     elif cfg is None:
-        llm_errors.append("no corrector key (DEEPSEEK_API_KEY/GLM_API_KEY) in ~/.hermes/.env; LLM correction skipped")
+        llm_errors.append("no GLM_API_KEY in ~/.hermes/.env; LLM correction skipped")
         print("[3/3] LLM-коррекция: нет ключа — пропуск", flush=True)
         fix_segment_junctions(segments)
     else:
@@ -743,7 +724,7 @@ def main():
     ap.add_argument("--language", default="ru")
     ap.add_argument("--model", default=DEFAULT_MODEL)
     ap.add_argument("--terms", default="", help="extra canonical terms, comma-separated")
-    ap.add_argument("--subs", default="", help="subtitle file (srt/vtt) as LLM-correction reference")
+    ap.add_argument("--subs", default="", help="subtitle file (srt/vtt) as second opinion for LLM correction")
     ap.add_argument("--no-llm", action="store_true", help="skip LLM correction (regex prepass only)")
     ap.add_argument("--save-corrections", action="store_true", help="save corrections sidecar (default: off)")
     ap.add_argument("--debug-segments", action="store_true", help="save raw segments JSON sidecar")
