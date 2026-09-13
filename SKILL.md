@@ -47,13 +47,13 @@ metadata:
 
 Этапы: Silero VAD (паузы/эффекты отрезаются) → нарезка ≤28 с → mlx_whisper.transcribe() в одном
 процессе (`condition_on_previous_text=False`) → LLM-коррекция терминов
-(**glm-5.3-flash** (z.ai) для ВСЕХ языков, `reasoning_effort=low`): целиком одним вызовом до
+(**deepseek-flash** (DeepSeek) для ВСЕХ языков, `reasoning_effort=low`): целиком одним вызовом до
 10000 слов, свыше — рекурсивное уполовинивание (половины параллельно, каждая перепроверяется
 по лимиту; кусок, проваливший вызов или верификацию, делится дальше; единичный сегмент-неудачник
 остаётся regex-only; фиксированного мелкочанкового fallback нет), word-diff верификация,
 при ошибке — regex-результат → Канон-термины: словарь mishear + `--terms "Имя, Ещё Имя"` +
 авто-экстракция из субтитров при `--subs`.
-Ключ — `GLM_API_KEY` (+ опционально `GLM_BASE_URL`) в ~/.hermes/.env; оверрайд модели —
+Ключ — `DEEPSEEK_API_KEY` (+ опционально `DEEPSEEK_BASE_URL`) в ~/.hermes/.env; оверрайд модели —
 `CORRECT_MODEL_<LANG>`. Нет ключа или терминов/сабов — LLM-этап честно пропускается
 (honest-degrade), raw-текст.
 
@@ -135,8 +135,8 @@ mlx_whisper --model ~/.local/share/models/whisper-podlodka-turbo-MLX-q8 \
 - VAD-пайплайн требует: venv `~/.local/share/stt-vad/` (onnxruntime+numpy), Silero onnx
   `~/.local/share/models/silero-vad/silero_vad.onnx`, ffmpeg. Запускать именно uv-tool питоном
   (`~/.local/share/uv/tools/mlx-whisper/bin/python`) — там mlx. LLM-этап деградирует честно:
-  без GLM_API_KEY или при ошибке чанка — raw-текст, ошибка фиксируется в MD.
-- GLM-корректор: `reasoning_effort=low` — единицы тысяч reasoning-токенов; полный thinking
+  без DEEPSEEK_API_KEY или при ошибке чанка — raw-текст, ошибка фиксируется в MD.
+- LLM-корректор (deepseek-flash): `reasoning_effort=low` — единицы тысяч reasoning-токенов; полный thinking
   (`{"thinking":{"type":"enabled"}}`) резко замедляет и корректору не нужен. Погоня за «выключить
   thinking совсем» через effort не работает — low и есть рабочий режим.
 - **Модель недетерминирована — не судить о промпте по одному прогону**: один и тот же вход

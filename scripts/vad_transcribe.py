@@ -7,7 +7,7 @@ Run with the mlx-whisper uv tool python:
 Stages:
   1. VAD   (silero venv + onnx model)          -> speech intervals
   2. STT   (segments <=28s, one process, condition_on_previous_text=False)
-  3. LLM   (glm-5.3-flash, reasoning_effort=low) -> term spelling correction. One call for
+  3. LLM   (deepseek-flash, reasoning_effort=low) -> term spelling correction. One call for
            the whole transcript up to WHOLE_MAX_WORDS; larger transcripts are halved recursively
            (halves in parallel). A piece failing the LLM call or word-diff verification is halved
            again; a single failing segment keeps its regex-only result.
@@ -42,17 +42,17 @@ VAD_MODEL = HOME / ".local/share/models/silero-vad/silero_vad.onnx"
 DEFAULT_MODEL = str(HOME / ".local/share/models/whisper-podlodka-turbo-MLX-q8")
 OUT_DIR = pathlib.Path("/Users/alexander/result-mlx-whisper")
 ENV_FILE = HOME / ".hermes/.env"
-LLM_MODEL = "glm-5.3-flash"   # corrector (z.ai GLM-5.3-Flash; every language, reasoning_effort=low)
+LLM_MODEL = "deepseek-flash"   # corrector (DeepSeek deepseek-flash; every language, reasoning_effort=low)
 
-# Corrector: glm-5.3-flash for every language. Key: GLM_API_KEY (+ optional GLM_BASE_URL
-# override) in ~/.hermes/.env; per-language model override CORRECT_MODEL_<LANG>
-# (e.g. CORRECT_MODEL_EN). No key -> LLM stage skipped honestly.
-GLM_URL_DEFAULT = "https://api.z.ai/api/paas/v4"
+# Corrector: deepseek-flash for every language. Key: DEEPSEEK_API_KEY (+ optional
+# DEEPSEEK_BASE_URL override) in ~/.hermes/.env; per-language model override
+# CORRECT_MODEL_<LANG> (e.g. CORRECT_MODEL_EN). No key -> LLM stage skipped honestly.
+DS_URL_DEFAULT = "https://api.deepseek.com"
 
 
 def read_llm_config(lang: str = "") -> tuple[str, str, str] | None:
     """Corrector (key, url, model) from ~/.hermes/.env; `lang` selects the optional
-    CORRECT_MODEL_<LANG> override. None when GLM_API_KEY is absent."""
+    CORRECT_MODEL_<LANG> override. None when DEEPSEEK_API_KEY is absent."""
     if not ENV_FILE.exists():
         return None
     env = {}
@@ -61,11 +61,11 @@ def read_llm_config(lang: str = "") -> tuple[str, str, str] | None:
         if "=" in line and not line.startswith("#"):
             k, v = line.split("=", 1)
             env[k.strip()] = v.strip().strip('"').strip("'")
-    key = env.get("GLM_API_KEY")
+    key = env.get("DEEPSEEK_API_KEY")
     if not key:
         return None
     model = env.get(f"CORRECT_MODEL_{lang.upper()}") or LLM_MODEL
-    url = (env.get("GLM_BASE_URL") or GLM_URL_DEFAULT).rstrip("/") + "/chat/completions"
+    url = (env.get("DEEPSEEK_BASE_URL") or DS_URL_DEFAULT).rstrip("/") + "/chat/completions"
     return key, url, model
 
 MAX_SEG = 28.0
@@ -646,7 +646,7 @@ def process_one(src: pathlib.Path, args):
         print("[3/3] LLM-коррекция пропущена (--no-llm)", flush=True)
         fix_segment_junctions(segments)
     elif cfg is None:
-        llm_errors.append("no GLM_API_KEY in ~/.hermes/.env; LLM correction skipped")
+        llm_errors.append("no DEEPSEEK_API_KEY in ~/.hermes/.env; LLM correction skipped")
         print("[3/3] LLM-коррекция: нет ключа — пропуск", flush=True)
         fix_segment_junctions(segments)
     else:
