@@ -115,7 +115,9 @@ mlx_whisper --model ~/.local/share/models/whisper-podlodka-turbo-MLX-q8 \
 1. Определить, что скачиваем (видео/mp3/плейлист/субтитры). Основной путь — скрипт `vad_transcribe.py`
    (VAD → STT → LLM-коррекция, датированный MD в `/Users/alexander/result-mlx-whisper/`).
 2. Запустить: `~/.local/share/uv/tools/mlx-whisper/bin/python ~/.hermes/skills/media/mlx-whisper/scripts/vad_transcribe.py <аудио> --language ru`;
-   для длинных файлов — `terminal(background=true)` + `process wait`. Скрипт печатает прогресс по этапам и `OK <путь>`.
+   для длинных файлов — `terminal(background=true, notify_on_complete=true)` + `process wait`.
+   Без `notify_on_complete=true` процесс завершится молча, а окно `wait` зажимается до 180 с —
+   длинную транскрипцию придётся опрашивать несколькими заходами. Скрипт печатает прогресс по этапам и `OK <путь>`.
 3. Прочитать созданный MD (`read_file`), показать пользователю текст и список LLM-правок.
 4. **ГЕЙТ — определить язык ДО запуска, иначе не запускать вообще** (запуск с чужим языком —
    полная потеря работы и полный перезапуск). Порядок:
