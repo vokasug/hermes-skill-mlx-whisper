@@ -681,6 +681,17 @@ def process_one(src: pathlib.Path, args):
 
     lines = [
         f"# Транскрипция — {src.name}", "",
+    ]
+    # content metadata block (always present; Название falls back to file stem)
+    lines.append(f"- **Название:** {args.meta_title or stem}")
+    if args.meta_author:
+        lines.append(f"- **Автор:** {args.meta_author}")
+    if args.meta_date:
+        lines.append(f"- **Дата публикации:** {args.meta_date}")
+    if args.meta_url:
+        lines.append(f"- **Ссылка:** {args.meta_url}")
+    lines += [
+        "",
         f"- **Дата:** {datetime.date.today().isoformat()}",
         f"- **Источник:** `{src}`",
         f"- **Субтитры:** {subs_line}",
@@ -728,6 +739,10 @@ def main():
     ap.add_argument("--no-llm", action="store_true", help="skip LLM correction (regex prepass only)")
     ap.add_argument("--save-corrections", action="store_true", help="save corrections sidecar (default: off)")
     ap.add_argument("--debug-segments", action="store_true", help="save raw segments JSON sidecar")
+    ap.add_argument("--meta-title", default="", help="content title (video name); default: file stem")
+    ap.add_argument("--meta-author", default="", help="content author/channel")
+    ap.add_argument("--meta-date", default="", help="content publication date (YYYY-MM-DD), omit if unknown")
+    ap.add_argument("--meta-url", default="", help="canonical content URL (no tracking/time params)")
     args = ap.parse_args()
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
