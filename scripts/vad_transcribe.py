@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Full STT pipeline: Silero VAD -> mlx_whisper -> LLM term correction -> paragraph transcript.
+"""Full STT pipeline: Silero VAD -> mlx_whisper -> term correction -> paragraph transcript.
 
 Run with the mlx-whisper uv tool python:
   ~/.local/share/uv/tools/mlx-whisper/bin/python vad_transcribe.py <audio> [audio2...] [--language ru]
@@ -7,23 +7,28 @@ Run with the mlx-whisper uv tool python:
 Stages:
   1. VAD   (silero venv + onnx model)          -> speech intervals
   2. STT   (segments <=28s, one process, condition_on_previous_text=False)
-  3. LLM   (deepseek-flash, reasoning_effort=low) -> term spelling correction. One call for
-           the whole transcript up to WHOLE_MAX_WORDS; larger transcripts are halved recursively
-           (halves in parallel). A piece failing the LLM call or word-diff verification is halved
-           again; a single failing segment keeps its regex-only result.
+  3. Correction prep: regex prepass (mishear dictionary) + junction fix. When canonical
+     terms or subtitles exist, writes <stem>.correct-payload.json next to the MD.
+
+Correction is an advisor/judge loop with the MAIN AGENT MODEL as advisor:
+  - advisor (main model): rewrites the payload's base_text fixing only mishearings and term
+    spelling -> <stem>.corrected.txt (full text, whole transcript at once);
+  - judge (this script):  --apply-corrections PAYLOAD CORRECTED re-verifies the output with
+    deterministic gates (word-diff budget; positional numeric gate) and rewrites the MD.
+    Rejected output leaves the MD on the regex-only base.
 
 Rendering: transcript is cut into sentences (by terminal punctuation of the word stream), then
 sentences are grouped into ~60 s blocks — a new block starts at the sentence boundary nearest to
 (block start + 60 s). Every block renders as one line "**mm:ss** text" followed by a blank line.
-Deterministic; no LLM involved.
+Deterministic; no model involved.
 
 Main output: ~/result-mlx-whisper/YYYY-MM-DD_<stem>.md  — readable transcript with timestamps.
-Sidecars (only when applicable): <stem>.corrections.md (LLM change log), <stem>.segments.json (--debug-segments).
---no-llm skips stage 3.
+Sidecars (when applicable): <stem>.correct-payload.json, <stem>.corrected.txt,
+<stem>.corrections.md (applied change log), <stem>.segments.json (--debug-segments).
+--no-correct skips stage 3 (no payload, regex-only text).
 """
 import argparse
 import collections
-import concurrent.futures
 import datetime
 import difflib
 import json
@@ -33,7 +38,6 @@ import subprocess
 import sys
 import tempfile
 import time
-import urllib.request
 
 HOME = pathlib.Path.home()
 VAD_PY = HOME / ".local/share/stt-vad/venv/bin/python"
@@ -41,39 +45,13 @@ VAD_SCRIPT = pathlib.Path(__file__).parent / "vad_segments.py"   # sibling in sk
 VAD_MODEL = HOME / ".local/share/models/silero-vad/silero_vad.onnx"
 DEFAULT_MODEL = str(HOME / ".local/share/models/whisper-podlodka-turbo-MLX-q8")
 OUT_DIR = pathlib.Path("/Users/alexander/result-mlx-whisper")
-ENV_FILE = HOME / ".hermes/.env"
-LLM_MODEL = "deepseek-flash"   # corrector (DeepSeek deepseek-flash; every language, reasoning_effort=low)
-
-# Corrector: deepseek-flash for every language. Key: DEEPSEEK_API_KEY (+ optional
-# DEEPSEEK_BASE_URL override) in ~/.hermes/.env; per-language model override
-# CORRECT_MODEL_<LANG> (e.g. CORRECT_MODEL_EN). No key -> LLM stage skipped honestly.
-DS_URL_DEFAULT = "https://api.deepseek.com"
-
-
-def read_llm_config(lang: str = "") -> tuple[str, str, str] | None:
-    """Corrector (key, url, model) from ~/.hermes/.env; `lang` selects the optional
-    CORRECT_MODEL_<LANG> override. None when DEEPSEEK_API_KEY is absent."""
-    if not ENV_FILE.exists():
-        return None
-    env = {}
-    for line in ENV_FILE.read_text().splitlines():
-        line = line.strip()
-        if "=" in line and not line.startswith("#"):
-            k, v = line.split("=", 1)
-            env[k.strip()] = v.strip().strip('"').strip("'")
-    key = env.get("DEEPSEEK_API_KEY")
-    if not key:
-        return None
-    model = env.get(f"CORRECT_MODEL_{lang.upper()}") or LLM_MODEL
-    url = (env.get("DEEPSEEK_BASE_URL") or DS_URL_DEFAULT).rstrip("/") + "/chat/completions"
-    return key, url, model
 
 MAX_SEG = 28.0
 GAP_MERGE = 0.25
 PAD = 0.15
 PARA_TARGET_S = 60.0  # block target: a new block starts at the sentence boundary nearest to +60s
 
-# Built-in mishear -> canonical map (source-2 term extraction from the draft).
+# Built-in mishear -> canonical map (term extraction from the draft).
 MISHEAR_MAP = {
     "codecs": "Codex", "codex belts": "Codex builds", "quad code": "Claude Code", "cloud code": "Claude Code",
     "deep-swee": "DeepSeek", "deep swee": "DeepSeek", "deep sweep": "DeepSeek",
@@ -94,6 +72,30 @@ LOWER_STARTERS = {
     "как", "в", "на", "с", "для", "к", "по", "у", "за", "от", "там", "тут", "ещё", "тоже",
 }
 
+# Instructions embedded into every correction payload — the advisor (main agent model)
+# reads them from the payload file itself, so the payload is self-contained.
+CORRECTOR_INSTRUCTIONS = """\
+You are correcting a speech-to-text transcript. This payload gives you:
+- base_text: BASE TRANSCRIPT (Whisper, local model) — its word stream, word order and
+  structure are authoritative;
+- canonical: canonical spellings of terms that must be fixed;
+- spans: LOW-CONFIDENCE BASE SPANS — places where Whisper itself reported uncertainty;
+  these are the prime suspects for mishearings. Every span NOT listed was recognized
+  with high confidence;
+- subs_text (may be empty): ALT-TRANSCRIPT (auto-captions) — a SECOND OPINION, NOT a
+  reference and NOT necessarily accurate. It has its own systematic errors (numbers often
+  mangled, words dropped or merged). Never trust it over the base without a knowledge-based
+  reason.
+Decide each divergence on its merits: if your own knowledge (technical terms, brands,
+product names, version numbers) tells you the correct form — use it. Where knowledge does
+not help and Whisper was confident about the span — prefer the base.
+Fix ONLY clear mishearings and wrong spellings/casing of terms, including the canonical
+list. WHEN IN DOUBT, KEEP THE BASE TEXT UNCHANGED.
+Rules: (1) The base word stream is preserved: replace words in place; never add, drop,
+merge or reorder words. (2) Do NOT rephrase or restyle. (3) Do NOT change punctuation or
+grammar. (4) Numbers: keep the base transcript's numeric forms exactly; never convert
+between words and digits. (5) Output ONLY the full corrected base text, no comments."""
+
 
 def fmt_ts(sec) -> str:
     if sec is None:
@@ -108,14 +110,6 @@ def fmt_short(sec) -> str:
     m, s = divmod(sec, 60)
     h, m = divmod(m, 60)
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
-
-
-def clean_word(w: str) -> str:
-    return re.sub(r"[^\w'-]", "", w.lower())
-
-
-def word_counter(text: str) -> collections.Counter:
-    return collections.Counter(w for w in (clean_word(t) for t in text.split()) if w)
 
 
 def run_vad(src: pathlib.Path) -> dict:
@@ -185,41 +179,6 @@ def fix_segment_junctions(segments: list) -> None:
             segments[i + 1]["text"] = b.replace(first_w, first_w[:1].lower() + first_w[1:], 1)
 
 
-class TruncatedError(RuntimeError):
-    """finish_reason=length. Deterministic for a given input size: retrying the SAME
-    request is a guaranteed repeat truncation (~2x cost burned for nothing) — the caller
-    halves the piece instead. Network/HTTP errors below are still retried."""
-
-
-def llm_call(system: str, user: str, cfg: tuple[str, str, str], attempts: int = 2) -> str:
-    """Chat completion for the corrector (reasoning_effort=low; temperature is a no-op
-    while thinking is on — kept for compat). cfg = (api_key, chat_completions_url, model).
-    Short timeout + bounded retries: a hung/dropped call must never stall the pipeline.
-    Truncation raises TruncatedError immediately (no retry — same size truncates again)."""
-    key, url, model = cfg
-    body = {"model": model,
-            "messages": [{"role": "system", "content": system},
-                         {"role": "user", "content": user}],
-            "temperature": 0.1, "max_tokens": 131072, "reasoning_effort": "low"}
-    last_exc = None
-    for attempt in range(attempts):
-        req = urllib.request.Request(
-            url, data=json.dumps(body).encode(),
-            headers={"Authorization": "Bearer " + key, "Content-Type": "application/json"})
-        try:
-            with urllib.request.urlopen(req, timeout=120) as r:
-                d = json.load(r)
-        except Exception as e:
-            last_exc = e
-            if attempt + 1 < attempts:
-                time.sleep(3 * (attempt + 1))
-            continue
-        if d["choices"][0].get("finish_reason") == "length":
-            raise TruncatedError("LLM output truncated (finish_reason=length); halve the piece")
-        return d["choices"][0]["message"]["content"]
-    raise last_exc
-
-
 def extract_canonical(full_text: str, extra_terms: list[str]) -> list[str]:
     low = full_text.lower()
     canon, seen = [], set()
@@ -236,7 +195,7 @@ def extract_canonical(full_text: str, extra_terms: list[str]) -> list[str]:
 
 def regex_prepass(text: str) -> tuple[str, list]:
     """Deterministic mishear fixes by word-boundary, case-insensitive regex.
-    Guaranteed (LLM-invisible) corrections; returns (text, applied [(rule, n)])."""
+    Guaranteed (advisor-invisible) corrections; returns (text, applied [(rule, n)])."""
     applied = []
     for wrong, right in MISHEAR_MAP.items():
         pat = r"\b" + re.escape(wrong) + r"\b"
@@ -283,10 +242,6 @@ def subs_for_range(cues: list, t0: float, t1: float, max_words: int = 700) -> st
         out.append(txt)
         words += w
     return " ".join(out)
-
-
-WHOLE_MAX_WORDS = 10000    # <= this many words: one LLM call; larger transcripts are halved
-                           # recursively (headroom vs max_tokens=131072)
 
 
 def extract_terms_from_subs(sub_cues: list, draft_text: str, max_terms: int = 25) -> list[str]:
@@ -340,57 +295,22 @@ def extract_terms_from_subs(sub_cues: list, draft_text: str, max_terms: int = 25
     return terms
 
 
-def build_corrector_prompts(canonical: list[str], sub_ref: str) -> tuple[str, str]:
-    canon_str = ", ".join(canonical)
-    system = (
-        "You are correcting a speech-to-text transcript. You are given TWO imperfect machine "
-        "transcripts of the same audio:\n"
-        "1. BASE TRANSCRIPT (Whisper, local model) — the base text. Its word stream, word order "
-        "and structure are authoritative.\n"
-    )
-    if sub_ref:
-        system += (
-            "2. ALT-TRANSCRIPT (auto-captions downloaded from the internet) — a SECOND OPINION from "
-            "another recognizer, NOT a reference and NOT necessarily accurate. It has its own "
-            "systematic errors (numbers often mangled, words dropped or merged). Never trust it "
-            "over the base without a knowledge-based reason.\n"
-        )
-    system += (
-        "The user message may also list LOW-CONFIDENCE BASE SPANS — places where Whisper itself "
-        "reported uncertainty; these are the prime suspects for mishearings, check them first "
-        "against the alt-transcript and your own knowledge. Every base span NOT listed there was "
-        "recognized by Whisper with high confidence.\n"
-        "Decide each divergence on its merits: if your own knowledge (technical terms, brands, "
-        "product names, version numbers) tells you the correct form — use it. Where knowledge "
-        "does not help and Whisper was confident about the span — prefer the base.\n"
-        "Fix ONLY clear mishearings and wrong spellings/casing of terms"
-        + (", including this canonical list: " + canon_str + ". " if canon_str else ". ")
-        + "WHEN IN DOUBT, KEEP THE BASE TEXT UNCHANGED.\n"
-        "Rules: (1) The base word stream is preserved: replace words in place; never add, drop, "
-        "merge or reorder words. (2) Do NOT rephrase or restyle. (3) Do NOT change punctuation or "
-        "grammar. (4) Numbers: keep the base transcript's numeric forms exactly; never convert "
-        "between words and digits. (5) Output ONLY the corrected base text, no comments."
-    )
-    return system, sub_ref
-
-
 def numeric_tokens(s: str) -> list[str]:
-    """All digit runs incl. separated forms ($3.12 -> ['3.12']); used to guarantee the
-    LLM never alters numbers regardless of what the prompt says."""
+    """All digit runs incl. separated forms ($3.12 -> ['3.12']); the numeric gate
+    guarantees corrections never alter numbers regardless of advisor intent."""
     return re.findall(r"\d+(?:[.,:]\d+)*", s)
 
 
 LOGPROB_LOW = -0.7  # avg_logprob below this = Whisper itself was unsure about the segment
 
 
-def uncertain_spans(chunk: list, max_spans: int = 40) -> list[str]:
-    return [s["text"] for s in chunk
+def uncertain_spans(segments: list, max_spans: int = 40) -> list[str]:
+    return [s["text"] for s in segments
             if s.get("logprob") is not None and s["logprob"] < LOGPROB_LOW][:max_spans]
 
 
-def verify_llm_out(pre_text: str, out: str) -> tuple | None:
-    """Acceptance gate. Allows replace opcodes of any span (number merges like
-    'V four point five' -> 'V 4.5' are legitimate) plus tiny insert/delete wiggle;
+def verify_correction_out(pre_text: str, out: str) -> tuple | None:
+    """Acceptance gate. Allows replace opcodes of any span plus tiny insert/delete wiggle;
     rejects on large drift. Returns (opcodes, base_words, out_words) or None."""
     rw, ow = pre_text.split(), out.split()
     budget = min(10, max(2, len(rw) // 100))
@@ -410,131 +330,52 @@ def verify_llm_out(pre_text: str, out: str) -> tuple | None:
     return ops, rw, ow
 
 
-def correct_stage(segments: list, canonical: list[str], cfg: tuple,
-                  sub_cues: list | None = None) -> tuple[list, list, list]:
-    """Term spelling correction: regex prepass (guaranteed) + LLM for the rest.
-    A piece of <=WHOLE_MAX_WORDS words is corrected in ONE call — consistent term casing
-    across it. Larger pieces are halved recursively (halves run in parallel, each half is
-    re-checked against the limit). A piece that fails the LLM call or strict verification
-    is halved again; a single failing segment keeps its regex-only result. There is no
-    fixed small-chunk fallback: halving keeps pieces as large as possible, preserving
-    cross-piece term consistency. Returns (segments, change_log, errors)."""
-    log, errors = [], []
-    seg_fixed: list = [None] * len(segments)
+def redistribute_words(chunk: list, text: str) -> tuple[list, tuple | None]:
+    """Map a corrected word stream back onto segments by original word counts. A longer
+    output's tail is appended to the last segment (never silently dropped).
+    Returns (fixed_texts, note_or_None)."""
+    outw = text.split()
+    fixed, wpos = [], 0
+    for s in chunk:
+        n = len(s["text"].split())
+        fixed.append(" ".join(outw[wpos:wpos + n]))
+        wpos += n
+    note = None
+    if fixed and wpos < len(outw):
+        extra = len(outw) - wpos
+        fixed[-1] = (fixed[-1] + " " + " ".join(outw[wpos:])).strip()
+        note = (f"+{extra} слов", "вывод длиннее входа — хвост приписан к концу")
+    return fixed, note
 
-    def redistribute(chunk, text: str) -> list[str]:
-        outw = text.split()
-        fixed, wpos = [], 0
-        for s in chunk:
-            n = len(s["text"].split())
-            fixed.append(" ".join(outw[wpos:wpos + n]))
-            wpos += n
-        if fixed and wpos < len(outw):
-            # LLM вернул больше слов, чем во входе (verify-бюджет это разрешает): хвост
-            # приписываем к последнему сегменту куска, а не отбрасываем молча
-            extra = len(outw) - wpos
-            fixed[-1] = (fixed[-1] + " " + " ".join(outw[wpos:])).strip()
-            log.append((f"+{extra} слов", "вывод длиннее входа — хвост приписан к концу куска"))
-        return fixed
 
-    def llm_correct(chunk, sub_ref: str, label: str):
-        """Returns (fixed_texts, changes, error). regex prepass always applied."""
-        raw_text = " ".join(s["text"] for s in chunk)
-        pre_text, pre_rules = regex_prepass(raw_text)
-        for rule, n in pre_rules:
-            log.append((rule, f"×{n} (regex, гарантированно)"))
-        if not canonical and not sub_ref:
-            return redistribute(chunk, pre_text), [], None
-        system, sub_ref = build_corrector_prompts(canonical, sub_ref)
-        parts = []
-        if sub_ref:
-            parts.append("ALT-TRANSCRIPT (second opinion, error-prone):\n" + sub_ref)
-        spans = uncertain_spans(chunk)
-        if spans:
-            parts.append("LOW-CONFIDENCE BASE SPANS (Whisper unsure, check first):\n"
-                         + "\n".join("- " + t for t in spans))
-        parts.append("BASE TRANSCRIPT TO CORRECT (output only this, corrected):\n" + pre_text)
-        user_msg = "\n\n".join(parts)
-        try:
-            out = llm_call(system, user_msg, cfg)
-        except Exception as e:
-            return redistribute(chunk, pre_text), [], f"{label}: LLM error ({type(e).__name__}); regex-only"
-        ver = verify_llm_out(pre_text, out)
-        if ver is None:
-            return redistribute(chunk, pre_text), [], f"{label}: strict verify failed (word count/insert-delete); regex-only"
-        # deterministic numeric guard, POSITIONAL: rebuild the output from opcodes,
-        # taking base words for any opcode whose digit tokens differ ($3.12->$312,
-        # words->$3.60, digit-bearing deletions). Prompts are advisory, this is enforced.
-        ops, rw, ow = ver
-        final, kept = [], []
-        for tag, i1, i2, j1, j2 in ops:
-            if tag == "equal":
-                final.extend(ow[j1:j2])
-                continue
-            a, b = " ".join(rw[i1:i2]), " ".join(ow[j1:j2])
-            if numeric_tokens(a) != numeric_tokens(b):
-                final.extend(rw[i1:i2])
-                log.append((a, f"{b} (ОТКЛОНЕНО: числа)"))
-            else:
-                final.extend(ow[j1:j2])
-                kept.append((a, b))
-        return redistribute(chunk, " ".join(final)), kept, None
-
-    def word_count(idxs) -> int:
-        return sum(len(segments[i]["text"].split()) for i in idxs)
-
-    def split_half(idxs) -> tuple[list, list]:
-        """Split segment index list into two halves by word count (both non-empty)."""
-        half_words, acc, cut = word_count(idxs) / 2, 0, len(idxs) // 2
-        for k, i in enumerate(idxs):
-            acc += len(segments[i]["text"].split())
-            if acc >= half_words:
-                cut = k + 1
-                break
-        cut = min(max(cut, 1), len(idxs) - 1)
-        return idxs[:cut], idxs[cut:]
-
-    def process(idxs, label: str):
-        """Correct segments[idxs]; returns error string or None. Halves on overflow/failure."""
-        if word_count(idxs) <= WHOLE_MAX_WORDS or len(idxs) == 1:
-            chunk = [segments[i] for i in idxs]
-            # subs reference scaled to piece size
-            max_sub_words = max(700, int(word_count(idxs) * 1.2))
-            sub_ref = (subs_for_range(sub_cues, chunk[0]["start"], chunk[-1]["end"],
-                                      max_sub_words) if sub_cues else "")
-            log_mark = len(log)  # regex-prepass entries of THIS piece (llm_correct logs them
-                                 # before knowing acceptance); dropped if we fall to halving
-            fixed, changes, err = llm_correct(chunk, sub_ref, label)
-            if err is None or len(idxs) == 1:
-                for k, i in enumerate(idxs):
-                    seg_fixed[i] = fixed[k]
-                if err is None:
-                    log.extend(changes)
-                return err
-            del log[log_mark:]  # halves redo the regex prepass — keep the log free of duplicates
-            errors.append(err + " -> halving")
-        a, b = split_half(idxs)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
-            results = list(ex.map(lambda p: process(*p),
-                                  [(a, label + "a"), (b, label + "b")]))
-        errs = [e for e in results if e]
-        return "; ".join(errs) if errs else None
-
-    total_words = word_count(list(range(len(segments))))
-    err = process(list(range(len(segments))), "whole")
-    if err:
-        errors.append(err)
-    mode = ("целиком, один вызов" if total_words <= WHOLE_MAX_WORDS
-            else "рекурсивное уполовинивание")
-    print(f"      режим: {mode} ({total_words} слов)", flush=True)
-
-    out_segments = []
-    for s, fx in zip(segments, seg_fixed):
-        s2 = dict(s)
-        if fx is not None:
-            s2["text"] = fx
-        out_segments.append(s2)
-    return out_segments, log, errors
+def apply_corrections(payload: dict, corrected_text: str) -> dict:
+    """Judge: verify the advisor's corrected text against payload["base_text"] with the
+    deterministic gates (word-diff budget; positional numeric gate — any edit whose digit
+    tokens differ is rolled back to the base words in place). Returns a dict:
+    status "ok" with corrected segments/changes/rejected, or "rejected" with the base kept."""
+    base = payload["base_text"]
+    segments = payload["segments"]
+    ver = verify_correction_out(base, corrected_text)
+    if ver is None:
+        return {"status": "rejected", "reason": "word-diff verify failed (word count/insert-delete)",
+                "segments": segments, "changes": [], "rejected": [], "note": None}
+    ops, rw, ow = ver
+    final, changes, rejected = [], [], []
+    for tag, i1, i2, j1, j2 in ops:
+        if tag == "equal":
+            final.extend(ow[j1:j2])
+            continue
+        a, b = " ".join(rw[i1:i2]), " ".join(ow[j1:j2])
+        if numeric_tokens(a) != numeric_tokens(b):
+            final.extend(rw[i1:i2])
+            rejected.append((a, b))
+        else:
+            final.extend(ow[j1:j2])
+            changes.append((a, b))
+    fixed, note = redistribute_words(segments, " ".join(final))
+    out_segments = [dict(s, text=fx) for s, fx in zip(segments, fixed)]
+    return {"status": "ok", "segments": out_segments, "changes": changes,
+            "rejected": rejected, "note": note}
 
 
 def group_into_blocks(sents: list[dict], audio_end: float | None = None) -> list[list[dict]]:
@@ -610,6 +451,40 @@ def split_into_sentences(segments: list) -> list[dict]:
     return [{"start": sent[0][1], "text": " ".join(w for w, _ in sent)} for sent in sents]
 
 
+def build_md_lines(info: dict, segments: list, corr_line: str) -> list[str]:
+    """Full MD: header (content metadata block first, then technical lines) + transcript
+    rendered into ~60 s blocks. Shared by the transcribe run and --apply-corrections."""
+    lines = [f"# Транскрипция — {info['src_name']}", ""]
+    # content metadata block (always present; Название falls back to file name with extension)
+    m = info["meta"]
+    lines.append(f"- **Название:** {m.get('title') or info['src_name']}")
+    if m.get("author"):
+        lines.append(f"- **Автор:** {m['author']}")
+    if m.get("date"):
+        lines.append(f"- **Дата публикации:** {m['date']}")
+    if m.get("url"):
+        lines.append(f"- **Ссылка:** {m['url']}")
+    lines += [
+        "",
+        f"- **Дата:** {info['date']}",
+        f"- **Источник:** `{info['src']}`",
+        f"- **Субтитры:** {info['subs_line']}",
+        f"- **Длительность:** {fmt_ts(info['duration'])} | речь (VAD): {info['speech_s']/60:.1f} мин ({info['speech_ratio']*100:.0f}%)",
+        f"- **Модель:** {info['model']}, язык: {info['language']}, VAD: Silero",
+        f"- **Коррекция терминов:** {corr_line}",
+        f"- **Время:** VAD {info['t_vad']:.0f}с + STT {info['t_stt']:.0f}с = {(info['t_vad'] + info['t_stt'])/60:.1f} мин",
+        "", "## Транскрипт", "",
+    ]
+    # render: sentences -> ~60 s blocks; each block = one "**mm:ss** text" line + blank line
+    sents = split_into_sentences(segments)
+    for block in group_into_blocks(sents, audio_end=float(info["duration"])):
+        ts = fmt_short(block[0]["start"])
+        lines.append(f"**{ts}** " + " ".join(s["text"] for s in block))
+        lines.append("")
+    lines.append("")
+    return lines
+
+
 def process_one(src: pathlib.Path, args):
     t0 = time.time()
     print(f"[1/3] VAD: {src.name}", flush=True)
@@ -623,13 +498,9 @@ def process_one(src: pathlib.Path, args):
     print(f"[2/3] STT ({args.language})...", flush=True)
     segments, stt_info = cut_and_transcribe(src, vad, args.model, args.language)
     t_stt = time.time() - t1
-    t_llm = 0.0
     draft_words = sum(len(s["text"].split()) for s in segments)
     print(f"      {stt_info['sent']} сегментов, {draft_words} слов — {t_stt:.0f}с", flush=True)
 
-    cfg = read_llm_config(args.language)
-    llm_model = cfg[2] if cfg else LLM_MODEL
-    change_log, llm_errors, canonical = [], [], []
     sub_cues = None
     if args.subs:
         sp = pathlib.Path(args.subs).expanduser()
@@ -638,90 +509,74 @@ def process_one(src: pathlib.Path, args):
             print(f"      субтитры: {sp.name} — {len(sub_cues)} реплик", flush=True)
             if not sub_cues:
                 sub_cues = None
-                llm_errors.append(f"subs file {sp.name} parsed to 0 cues; ignored")
+                print(f"      субтитры: {sp.name} распарсились в 0 реплик — игнорируются", flush=True)
         else:
-            llm_errors.append(f"subs file not found: {sp}; ignored")
+            print(f"      субтитры: файл не найден: {sp} — игнорируются", flush=True)
+    subs_line = (f"`{args.subs}` ({len(sub_cues)} реплик) — второе мнение для коррекции"
+                 if sub_cues else "не использовались")
 
-    if args.no_llm:
-        print("[3/3] LLM-коррекция пропущена (--no-llm)", flush=True)
+    stem = re.sub(r"^\d{4}-\d{2}-\d{2}_", "", src.stem)
+    out = OUT_DIR / f"{datetime.date.today().isoformat()}_{stem}.md"
+    info = {
+        "src_name": src.name, "src": str(src),
+        "meta": {"title": args.meta_title, "author": args.meta_author,
+                 "date": args.meta_date, "url": args.meta_url},
+        "date": datetime.date.today().isoformat(),
+        "duration": vad["duration"], "speech_s": speech_s, "speech_ratio": vad["speech_ratio"],
+        "model": pathlib.Path(args.model).name, "language": args.language,
+        "subs_line": subs_line, "t_vad": t_vad, "t_stt": t_stt,
+    }
+
+    canonical, regex_log, payload_path = [], [], None
+    if args.no_correct:
         fix_segment_junctions(segments)
-    elif cfg is None:
-        llm_errors.append("no DEEPSEEK_API_KEY in ~/.hermes/.env; LLM correction skipped")
-        print("[3/3] LLM-коррекция: нет ключа — пропуск", flush=True)
-        fix_segment_junctions(segments)
+        corr_line = "выключена (--no-correct)"
+        print("[3/3] Коррекция терминов: выключена (--no-correct)", flush=True)
     else:
         draft_text = " ".join(s["text"] for s in segments)
-        canonical = extract_canonical(draft_text, [t.strip() for t in args.terms.split(",") if t.strip()])
+        canonical = extract_canonical(draft_text,
+                                      [t.strip() for t in args.terms.split(",") if t.strip()])
         if sub_cues:
             auto = [t for t in extract_terms_from_subs(sub_cues, draft_text) if t not in canonical]
             if auto:
                 canonical += auto
                 print(f"      авто-термины из субтитров ({len(auto)}): {', '.join(auto)}", flush=True)
         if canonical or sub_cues:
-            t2 = time.time()
-            src_note = " + субтитры-референс" if sub_cues else ""
-            print(f"[3/3] LLM-коррекция ({llm_model}): канонов {len(canonical)}{src_note}"
+            pre_text, pre_rules = regex_prepass(draft_text)
+            regex_log = [[rule, n] for rule, n in pre_rules]
+            fixed, note = redistribute_words(segments, pre_text)
+            for s, fx in zip(segments, fixed):
+                s["text"] = fx
+            fix_segment_junctions(segments)
+            base_text = " ".join(s["text"] for s in segments)
+            subs_text = (subs_for_range(sub_cues, segments[0]["start"], segments[-1]["end"],
+                                        max(700, int(draft_words * 1.2))) if sub_cues else "")
+            payload_path = out.with_name(out.stem + ".correct-payload.json")
+            corrected_path = out.with_name(out.stem + ".corrected.txt")
+            payload = dict(info, version=1, out=str(out), segments=segments,
+                           base_text=base_text, canonical=canonical,
+                           spans=uncertain_spans(segments), subs_text=subs_text,
+                           regex_log=regex_log, instructions=CORRECTOR_INSTRUCTIONS)
+            payload_path.write_text(json.dumps(payload, ensure_ascii=False, indent=1),
+                                    encoding="utf-8")
+            src_note = " + субтитры-второе-мнение" if sub_cues else ""
+            print(f"[3/3] Коррекция терминов: канонов {len(canonical)}{src_note}"
                   + (f": {', '.join(canonical)}" if canonical else ""), flush=True)
-            segments, change_log, llm_errors2 = correct_stage(segments, canonical, cfg, sub_cues)
-            llm_errors.extend(llm_errors2)
-            t_llm = time.time() - t2
-            print(f"      правок {len(change_log)} — {t_llm:.0f}с", flush=True)
+            print(f"      payload → {payload_path}", flush=True)
+            print(f"      следующий шаг: основная модель правит base_text → {corrected_path.name}, "
+                  f"затем --apply-corrections", flush=True)
+            corr_line = f"payload `{payload_path.name}` — ожидает правок основной модели"
         else:
-            print("[3/3] LLM-коррекция: терминов не найдено — пропуск", flush=True)
-        fix_segment_junctions(segments)
-    total = time.time() - t0
-    stem = re.sub(r"^\d{4}-\d{2}-\d{2}_", "", src.stem)
-    out = OUT_DIR / f"{datetime.date.today().isoformat()}_{stem}.md"
+            fix_segment_junctions(segments)
+            corr_line = "не потребовалась (терминов не найдено)"
+            print("[3/3] Коррекция терминов: терминов не найдено — пропуск", flush=True)
 
-    llm_line = "выключена (--no-llm)" if args.no_llm else (
-        f"{llm_model} (reasoning_effort=low); канонов {len(canonical)}, правок {len(change_log)}, {t_llm:.0f}с"
-        if (canonical or change_log or sub_cues) else "не потребовалась (терминов не найдено)")
-    subs_line = (f"`{args.subs}` ({len(sub_cues)} реплик) — референс LLM-коррекции"
-                 if sub_cues else "не использовались")
-
-    lines = [
-        f"# Транскрипция — {src.name}", "",
-    ]
-    # content metadata block (always present; Название falls back to file name with extension)
-    lines.append(f"- **Название:** {args.meta_title or src.name}")
-    if args.meta_author:
-        lines.append(f"- **Автор:** {args.meta_author}")
-    if args.meta_date:
-        lines.append(f"- **Дата публикации:** {args.meta_date}")
-    if args.meta_url:
-        lines.append(f"- **Ссылка:** {args.meta_url}")
-    lines += [
-        "",
-        f"- **Дата:** {datetime.date.today().isoformat()}",
-        f"- **Источник:** `{src}`",
-        f"- **Субтитры:** {subs_line}",
-        f"- **Длительность:** {fmt_ts(vad['duration'])} | речь (VAD): {speech_s/60:.1f} мин ({vad['speech_ratio']*100:.0f}%)",
-        f"- **Модель:** {pathlib.Path(args.model).name}, язык: {args.language}, VAD: Silero",
-        f"- **LLM-коррекция:** {llm_line}",
-        f"- **Время:** VAD {t_vad:.0f}с + STT {t_stt:.0f}с + LLM {t_llm:.0f}с = {total/60:.1f} мин",
-        "", "## Транскрипт", "",
-    ]
-    # render: sentences -> ~60 s blocks; each block = one "**mm:ss** text" line + blank line
-    sents = split_into_sentences(segments)
-    for block in group_into_blocks(sents, audio_end=float(vad["duration"])):
-        ts = fmt_short(block[0]["start"])
-        lines.append(f"**{ts}** " + " ".join(s["text"] for s in block))
-        lines.append("")
-    lines.append("")
-    out.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    out.write_text("\n".join(build_md_lines(info, segments, corr_line)).rstrip() + "\n",
+                   encoding="utf-8")
     print(f"OK {out}")
+    if payload_path:
+        print(f"PAYLOAD {payload_path}")
 
-    if args.save_corrections and change_log:
-        cpath = out.with_suffix(".corrections.md")
-        clines = [f"# LLM-правки — {src.name}", "",
-                  f"Модель: {llm_model} (reasoning_effort=low), канон-терминов: {len(canonical)}. "
-                  "Каждая правка проверена word-diff'ом; чанки с ошибкой оставлены без правок.", ""]
-        for a, b in change_log:
-            clines.append(f"- `{a}` → `{b}`")
-        if llm_errors:
-            clines += ["", "## Ошибки (чанки оставлены без правок)", ""] + [f"- {e}" for e in llm_errors]
-        cpath.write_text("\n".join(clines) + "\n", encoding="utf-8")
-        print(f"OK {cpath}")
     if args.debug_segments:
         spath = out.with_suffix(".segments.json")
         spath.write_text(json.dumps(
@@ -729,15 +584,55 @@ def process_one(src: pathlib.Path, args):
         print(f"OK {spath}")
 
 
+def apply_mode(payload_path: pathlib.Path, corrected_path: pathlib.Path):
+    payload = json.loads(payload_path.read_text(encoding="utf-8"))
+    corrected = corrected_path.read_text(encoding="utf-8").strip()
+    res = apply_corrections(payload, corrected)
+    out = pathlib.Path(payload["out"])
+
+    if res["status"] != "ok":
+        corr_line = f"ОТКЛОНЕНА верификацией ({res['reason']}) — текст оставлен без правок"
+        out.write_text("\n".join(build_md_lines(payload, payload["segments"], corr_line)).rstrip() + "\n",
+                       encoding="utf-8")
+        print(f"REJECTED {corrected_path}: {res['reason']}; MD без правок: {out}")
+        sys.exit(1)
+
+    changes, rejected = res["changes"], res["rejected"]
+    corr_line = f"основная модель; канонов {len(payload['canonical'])}, правок {len(changes)}"
+    if rejected:
+        corr_line += f", отклонено числовым гейтом: {len(rejected)}"
+    out.write_text("\n".join(build_md_lines(payload, res["segments"], corr_line)).rstrip() + "\n",
+                   encoding="utf-8")
+    print(f"OK {out}")
+
+    clines = [f"# Правки — {payload['src_name']}", "",
+              "Советчик: основная модель агента. Принятие каждой правки — детерминированные "
+              "гейты этого скрипта (word-diff бюджет, позиционный числовой гейт).", ""]
+    for rule, n in payload.get("regex_log", []):
+        clines.append(f"- `{rule}` ×{n} (regex, гарантированно)")
+    for a, b in changes:
+        clines.append(f"- `{a}` → `{b}`")
+    if res["note"]:
+        clines.append(f"- {res['note'][0]}: {res['note'][1]}")
+    if rejected:
+        clines += ["", "## Отклонено числовым гейтом", ""]
+        clines += [f"- `{a}` → `{b}` (ОТКЛОНЕНО: числа)" for a, b in rejected]
+    cpath = out.with_suffix(".corrections.md")
+    cpath.write_text("\n".join(clines) + "\n", encoding="utf-8")
+    print(f"OK {cpath}")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("audio", nargs="+")
+    ap.add_argument("audio", nargs="*")
+    ap.add_argument("--apply-corrections", nargs=2, metavar=("PAYLOAD_JSON", "CORRECTED_TXT"),
+                    help="judge step: verify advisor corrections with the deterministic gates "
+                         "and rewrite the MD")
     ap.add_argument("--language", default="ru")
     ap.add_argument("--model", default=DEFAULT_MODEL)
     ap.add_argument("--terms", default="", help="extra canonical terms, comma-separated")
-    ap.add_argument("--subs", default="", help="subtitle file (srt/vtt) as second opinion for LLM correction")
-    ap.add_argument("--no-llm", action="store_true", help="skip LLM correction (regex prepass only)")
-    ap.add_argument("--save-corrections", action="store_true", help="save corrections sidecar (default: off)")
+    ap.add_argument("--subs", default="", help="subtitle file (srt/vtt) as second opinion for correction")
+    ap.add_argument("--no-correct", action="store_true", help="skip correction prep (no payload, regex-only text)")
     ap.add_argument("--debug-segments", action="store_true", help="save raw segments JSON sidecar")
     ap.add_argument("--meta-title", default=None, help="content title (video name); default: file name with extension")
     ap.add_argument("--meta-author", default=None, help="content author/channel")
@@ -754,6 +649,17 @@ def main():
                 sys.exit(f"error: --{name.replace('_', '-')} передан с пустым значением — "
                          "пустые метаданные запрещены; запросите значение у пользователя")
             setattr(args, name, v)
+
+    if args.apply_corrections:
+        p, c = (pathlib.Path(x).expanduser() for x in args.apply_corrections)
+        if not p.exists():
+            sys.exit(f"error: payload not found: {p}")
+        if not c.exists():
+            sys.exit(f"error: corrected text not found: {c}")
+        apply_mode(p, c)
+        return
+    if not args.audio:
+        ap.error("нужны аудиофайлы или --apply-corrections PAYLOAD_JSON CORRECTED_TXT")
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     for raw in args.audio:
