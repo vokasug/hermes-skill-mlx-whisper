@@ -682,8 +682,8 @@ def process_one(src: pathlib.Path, args):
     lines = [
         f"# Транскрипция — {src.name}", "",
     ]
-    # content metadata block (always present; Название falls back to file stem)
-    lines.append(f"- **Название:** {args.meta_title or stem}")
+    # content metadata block (always present; Название falls back to file name with extension)
+    lines.append(f"- **Название:** {args.meta_title or src.name}")
     if args.meta_author:
         lines.append(f"- **Автор:** {args.meta_author}")
     if args.meta_date:
@@ -739,11 +739,21 @@ def main():
     ap.add_argument("--no-llm", action="store_true", help="skip LLM correction (regex prepass only)")
     ap.add_argument("--save-corrections", action="store_true", help="save corrections sidecar (default: off)")
     ap.add_argument("--debug-segments", action="store_true", help="save raw segments JSON sidecar")
-    ap.add_argument("--meta-title", default="", help="content title (video name); default: file stem")
-    ap.add_argument("--meta-author", default="", help="content author/channel")
-    ap.add_argument("--meta-date", default="", help="content publication date (YYYY-MM-DD), omit if unknown")
-    ap.add_argument("--meta-url", default="", help="canonical content URL (no tracking/time params)")
+    ap.add_argument("--meta-title", default=None, help="content title (video name); default: file name with extension")
+    ap.add_argument("--meta-author", default=None, help="content author/channel")
+    ap.add_argument("--meta-date", default=None, help="content publication date (YYYY-MM-DD)")
+    ap.add_argument("--meta-url", default=None, help="canonical content URL (no tracking/time params)")
     args = ap.parse_args()
+
+    # ГЕЙТ: пустые метаданные запрещены — --meta-* либо не передаётся, либо несёт непустое значение
+    for name in ("meta_title", "meta_author", "meta_date", "meta_url"):
+        v = getattr(args, name)
+        if v is not None:
+            v = v.strip()
+            if not v:
+                sys.exit(f"error: --{name.replace('_', '-')} передан с пустым значением — "
+                         "пустые метаданные запрещены; запросите значение у пользователя")
+            setattr(args, name, v)
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     for raw in args.audio:
