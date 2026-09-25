@@ -1,8 +1,8 @@
 ---
 name: mlx-whisper
 description: Local ru/en speech-to-text via MLX Whisper; load-run-exit.
-version: 1.3.0
-author: Hermes Agent
+version: 1.3.1
+author: vokasug, Hermes Agent
 license: MIT
 platforms: [macos]
 metadata:
