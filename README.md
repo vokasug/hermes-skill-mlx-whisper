@@ -101,7 +101,7 @@ mlx_whisper ... --task translate <аудио>
 
 ## Настройка под себя
 
-Скрипты содержат пути, захардкоженные под конкретную машину: `OUT_DIR` (`/Users/alexander/result-mlx-whisper`) в `scripts/vad_transcribe.py` и `scripts/transcribe_to_md.py`. Пути моделей и VAD-окружения строятся от `Path.home()` — они переносимы. На своём Mac замените `OUT_DIR` на свой.
+Скрипты пишут вывод в `~/result-mlx-whisper` — путь строится от домашней папки текущего пользователя (`OUT_DIR` в `scripts/vad_transcribe.py` и `scripts/transcribe_to_md.py` — от `pathlib.Path.home()`), ничего менять не нужно. Пути моделей и VAD-окружения тоже строятся от `Path.home()` — они переносимы.
 
 ## Структура репозитория
 

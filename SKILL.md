@@ -43,7 +43,7 @@ metadata:
 # 1) транскрибация: VAD → STT → regex-препасс → MD + payload для коррекции
 ~/.local/share/uv/tools/mlx-whisper/bin/python \
   ~/.hermes/skills/media/mlx-whisper/scripts/vad_transcribe.py <аудио> [ещё...] --language ru
-# результат: /Users/alexander/result-mlx-whisper/YYYY-MM-DD_<имя-аудио>.md
+# результат: ~/result-mlx-whisper/YYYY-MM-DD_<имя-аудио>.md
 #   + рядом <имя>.correct-payload.json (только когда есть канон-термины или субтитры)
 #   и строка PAYLOAD <путь> в выводе
 
@@ -146,7 +146,7 @@ mlx_whisper --model ~/.local/share/models/whisper-podlodka-turbo-MLX-q8 \
 ## Procedure
 
 1. Определить, что скачиваем (видео/mp3/плейлист/субтитры). Основной путь — скрипт `vad_transcribe.py`
-   (VAD → STT → подготовка коррекции, датированный MD в `/Users/alexander/result-mlx-whisper/`).
+   (VAD → STT → подготовка коррекции, датированный MD в `~/result-mlx-whisper/`).
 2. Запустить: `~/.local/share/uv/tools/mlx-whisper/bin/python ~/.hermes/skills/media/mlx-whisper/scripts/vad_transcribe.py <аудио> --language ru`;
    для длинных файлов — `terminal(background=true, notify_on_complete=true)` + `process wait`.
    Без `notify_on_complete=true` процесс завершится молча, а окно `wait` зажимается до 180 с —
@@ -196,7 +196,7 @@ mlx_whisper --model ~/.local/share/models/whisper-podlodka-turbo-MLX-q8 \
 
 0. Офлайн-тесты гейтов коррекции (без аудио и модели): `~/.local/share/uv/tools/mlx-whisper/bin/python ~/.hermes/skills/media/mlx-whisper/tests/test_gates.py` → `ALL TESTS OK`. Прогонять после любой правки apply_corrections/verify_correction_out/числового гейта/redistribute_words/build_md_lines.
 
-1. Скрипт напечатал `OK /Users/alexander/result-mlx-whisper/YYYY-MM-DD_<имя>.md`; файл существует и непустой (`read_file`): шапка с блоком контент-метаданных (Название/Автор/Дата публикации/Ссылка) и техническими метаданными (дата, источник, субтитры, длительность, модель, коррекция терминов, время) и транскрипт блоками `**mm:ss** текст` с пустой строкой после каждого блока. Если была строка `PAYLOAD` — шаг коррекции выполнен (шаг 3 Procedure) и шапка обновлена (`основная модель; канонов N, правок M` либо пометка об отклонении).
+1. Скрипт напечатал `OK ~/result-mlx-whisper/YYYY-MM-DD_<имя>.md`; файл существует и непустой (`read_file`): шапка с блоком контент-метаданных (Название/Автор/Дата публикации/Ссылка) и техническими метаданными (дата, источник, субтитры, длительность, модель, коррекция терминов, время) и транскрипт блоками `**mm:ss** текст` с пустой строкой после каждого блока. Если была строка `PAYLOAD` — шаг коррекции выполнен (шаг 3 Procedure) и шапка обновлена (`основная модель; канонов N, правок M` либо пометка об отклонении).
 2. Имя файла начинается с сегодняшней даты `YYYY-MM-DD_`.
 3. Процесс завершился: `pgrep -fl mlx_whisper` пуст — модель выгружена из RAM (норма CLI-процесса).
 4. Для длинного аудио сверить длительность последнего сегмента с ffprobe-duration.

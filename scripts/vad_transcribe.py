@@ -44,7 +44,7 @@ VAD_PY = HOME / ".local/share/stt-vad/venv/bin/python"
 VAD_SCRIPT = pathlib.Path(__file__).parent / "vad_segments.py"   # sibling in skill scripts/
 VAD_MODEL = HOME / ".local/share/models/silero-vad/silero_vad.onnx"
 DEFAULT_MODEL = str(HOME / ".local/share/models/whisper-podlodka-turbo-MLX-q8")
-OUT_DIR = pathlib.Path("/Users/alexander/result-mlx-whisper")
+OUT_DIR = HOME / "result-mlx-whisper"
 
 MAX_SEG = 28.0
 GAP_MERGE = 0.25
