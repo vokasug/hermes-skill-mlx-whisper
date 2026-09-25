@@ -311,11 +311,22 @@ def uncertain_spans(segments: list, max_spans: int = 40) -> list[str]:
 
 def verify_correction_out(pre_text: str, out: str) -> tuple | None:
     """Acceptance gate. Allows replace opcodes of any span plus tiny insert/delete wiggle;
-    rejects on large drift. Returns (opcodes, base_words, out_words) or None."""
+    rejects on large drift. Returns (opcodes, base_words, out_words) or None.
+    Reject reason with numbers: verify_correction_diag()."""
+    return _verify(pre_text, out)[0]
+
+
+def verify_correction_diag(pre_text: str, out: str) -> str:
+    """Human-readable gate verdict with numbers: 'OK: ...' or 'REJECT: <причина>'."""
+    return _verify(pre_text, out)[1]
+
+
+def _verify(pre_text: str, out: str) -> tuple:
     rw, ow = pre_text.split(), out.split()
-    budget = min(10, max(2, len(rw) // 100))
-    if abs(len(rw) - len(ow)) > budget:
-        return None
+    budget = max(2, min(25, len(rw) // 100))
+    delta = len(ow) - len(rw)
+    if abs(delta) > budget:
+        return None, f"REJECT: баланс слов {delta:+d} при бюджете {budget} (слов {len(rw)} → {len(ow)})"
     sm = difflib.SequenceMatcher(None, rw, ow)
     ops = sm.get_opcodes()
     id_total = 0
@@ -323,11 +334,12 @@ def verify_correction_out(pre_text: str, out: str) -> tuple | None:
         if tag in ("insert", "delete"):
             run = max(i2 - i1, j2 - j1)
             if run > 3:            # single run of >3 inserted/deleted words = hallucination
-                return None
+                words = rw[i1:i2] if tag == "delete" else ow[j1:j2]
+                return None, f"REJECT: {'удаление' if tag == 'delete' else 'вставка'} {run} слов подряд (лимит 3): «{' '.join(words)}»"
             id_total += run
     if id_total > budget:
-        return None
-    return ops, rw, ow
+        return None, f"REJECT: вставок/удалений суммарно {id_total} при бюджете {budget} (баланс слов {delta:+d})"
+    return (ops, rw, ow), f"OK: баланс слов {delta:+d}, вставок/удалений {id_total}, бюджет {budget}"
 
 
 def redistribute_words(chunk: list, text: str) -> tuple[list, tuple | None]:
@@ -357,7 +369,7 @@ def apply_corrections(payload: dict, corrected_text: str) -> dict:
     segments = payload["segments"]
     ver = verify_correction_out(base, corrected_text)
     if ver is None:
-        return {"status": "rejected", "reason": "word-diff verify failed (word count/insert-delete)",
+        return {"status": "rejected", "reason": verify_correction_diag(base, corrected_text),
                 "segments": segments, "changes": [], "rejected": [], "note": None}
     ops, rw, ow = ver
     final, changes, rejected = [], [], []

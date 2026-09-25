@@ -48,11 +48,19 @@ metadata:
 #   и строка PAYLOAD <путь> в выводе
 
 # 2) коррекция: ОСНОВНАЯ МОДЕЛЬ (ты) читает payload (инструкции в поле instructions),
-#    пишет исправленный base_text ЦЕЛИКОМ в <имя>.corrected.txt, затем судья-гейты:
+#    пишет исправленный base_text ЦЕЛИКОМ в <имя>.corrected.txt, затем префлайт и судья-гейты:
+#    префлайт (причина отказа с цифрами ДО вызова apply; OK → применять, REJECT → чинить по цифрам):
+~/.local/share/uv/tools/mlx-whisper/bin/python -c "
+import importlib.util, json, sys
+spec = importlib.util.spec_from_file_location('vt', '$HOME/.hermes/skills/media/mlx-whisper/scripts/vad_transcribe.py')
+vt = importlib.util.module_from_spec(spec); spec.loader.exec_module(vt)
+p = json.load(open(sys.argv[1])); print(vt.verify_correction_diag(p['base_text'], open(sys.argv[2]).read()))
+" <имя>.correct-payload.json <имя>.corrected.txt
 ~/.local/share/uv/tools/mlx-whisper/bin/python \
   ~/.hermes/skills/media/mlx-whisper/scripts/vad_transcribe.py \
   --apply-corrections <имя>.correct-payload.json <имя>.corrected.txt
-# exit 0 → MD переписан с правками + <имя>.corrections.md; exit 1 → вывод отклонён, MD на базе
+# exit 0 → MD переписан с правками + <имя>.corrections.md; exit 1 → вывод отклонён, MD на базе,
+# причина в строке REJECTED с цифрами (баланс слов / сумма вставок-удалений / бюджет / рывок)
 ```
 
 Этапы: Silero VAD (паузы/эффекты отрезаются) → нарезка ≤28 с → mlx_whisper.transcribe() в одном
@@ -98,7 +106,9 @@ payload для коррекции (базовый текст, канон-тер�
 - **Архитектура «советчик + судья»**: советчик (основная модель) периодически нарушает правила
   инструкций — принятие вывода решает только детерминированный код `--apply-corrections`,
   ДВА гейта: (а) word-diff бюджет —
-  пословный difflib входа/вывода: замены любого размера + вставки/удаления ≤10 слов суммарно
+  пословный difflib входа/вывода: замены любого размера + вставки/удаления ≤25 слов суммарно
+  (бюджет = max(2, min(25, слова//100)) — растёт с длиной транскрипта: легальные слияния
+  «два слова → дефисный компаунд» масштабируются с объёмом)
   и ≤3 за один рывок, больше — весь вывод отклоняется (regex-only, exit 1). Точное равенство числа
   слов НЕ требовать — слишком жёстко, режет легальные замены типа «V four point five → V 4.5».
   (б) числовой гейт — для каждой правки сравниваются digit-токены обеих сторон (`$3.12`→`3.12`);
@@ -144,7 +154,10 @@ mlx_whisper --model ~/.local/share/models/whisper-podlodka-turbo-MLX-q8 \
 3. **Коррекция (шаг обязателен, когда напечатана строка `PAYLOAD <путь>`)**: прочитать
    payload-JSON (правила — в поле `instructions`), написать исправленный `base_text` ЦЕЛИКОМ
    в `<имя>.corrected.txt` (полный текст, без комментариев, поток слов сохранён), затем
-   запустить `--apply-corrections <payload> <corrected.txt>`. exit 0 — MD переписан,
+   ПРЕФЛАЙТ `verify_correction_diag` (однострочник в Quick Reference: печатает «OK: баланс…,
+   бюджет…» или «REJECT: причина с цифрами») — отказ ловится до вызова apply, правки чинятся
+   по цифрам из сообщения, а не перебором вслепую; при OK запускать
+   `--apply-corrections <payload> <corrected.txt>`. exit 0 — MD переписан,
    правки в `<имя>.corrections.md`; exit 1 — вывод отклонён гейтами, MD остался на базе
    (тогда разобрать причину по сообщению REJECTED и, если правки были корректны по существу,
    переписать точнее). Без payload строки — коррекция не требовалась, MD уже финальный.
