@@ -1,7 +1,7 @@
 ---
 name: mlx-whisper
 description: local speech-to-text via mlx whisper
-version: 1.4.0
+version: 1.4.1
 author: vokasug, Hermes Agent
 license: MIT
 platforms: [macos]
@@ -151,6 +151,30 @@ mlx_whisper --model ~/.local/share/models/whisper-podlodka-turbo-MLX-q8 \
 # фрагмент файла: --clip-timestamps "30"  (формат mm:ss CLI НЕ понимает — только секунды)
 # промпт-контекст для имён/терминов: --initial-prompt "..." (термины НЕ исправляет, только стиль)
 ```
+
+## Машинное потребление другими скиллами
+
+Скиллы `multilingual-audio-replacement` и `translated-video-subtitles` используют этот
+STT-стек как общий. Стабильные контракты:
+
+- **Сегменты JSON (для пайплайнов):** `vad_transcribe.py <аудио> --language <code>
+  --no-correct --debug-segments` → рядом с MD пишется
+  `~/result-mlx-whisper/YYYY-MM-DD_<имя>.segments.json`:
+  `{"file": ..., "segments": [{"start", "end", "text", "logprob"}, ...]}` — сегменты
+  VAD-пайплайна с таймингами в секундах и avg_logprob Whisper. Путь не настраивается.
+- **Word timestamps:** vad_transcribe их не пишет; нужны пословные тайминги — сырой
+  mlx_whisper с `--word-timestamps True --output-format json` (см. Quick Reference).
+- **VAD — фильтр «речь vs не-речь», а не анти-шум**: Silero отбрасывает пение и
+  неречевые звуки (замер: 59 с песни → 0 интервалов). Следствия:
+  - проверочные транскрибации («стем пуст», «в финале не осталось исходной речи»,
+    аудиореференс 3–10 с для клонирования) делать ТОЛЬКО сырым CLI — через
+    vad_transcribe проверка пустоты проходит вакуумно, а из короткого сэмпла VAD
+    может молча уронить тихую речь;
+  - чистая песня на входе vad_transcribe → 0 сегментов — корректный результат
+    «речи нет», а не сбой.
+- **Точность таймингов VAD-пути**: старты сегментов/предложений запаздывают против
+  пословных таймингов в медиане на ~0.2 с, максимум до ~0.6 с (замер на en-речи).
+  Для монтажных нарезок по этим таймингам брать padding 0.2–0.25 с, а не 0.1 с.
 
 ## Procedure
 
