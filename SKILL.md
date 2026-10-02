@@ -1,7 +1,7 @@
 ---
 name: mlx-whisper
 description: local speech-to-text via mlx whisper
-version: 1.3.2
+version: 1.4.0
 author: vokasug, Hermes Agent
 license: MIT
 platforms: [macos]
@@ -13,27 +13,34 @@ metadata:
 
 # MLX Whisper Skill
 
-Локальное распознавание речи (ru/en) на Apple Silicon через mlx-whisper. Оптимум по скорости
-и качеству для русского. Загрузка → распознавание → выгрузка: модель занимает RAM только
-на время процесса mlx_whisper (~1.85 ГБ пик), демонов и резидентных процессов нет.
+Локальное распознавание речи на Apple Silicon через mlx-whisper. Модель выбирается
+автоматически по языку: русский — специализированная whisper-podlodka-turbo q8, все
+остальные — мультиязычная whisper-large-v3-turbo-8bit. Загрузка → распознавание →
+выгрузка: модель занимает RAM только на время процесса mlx_whisper (~1.85 ГБ пик),
+демонов и резидентных процессов нет.
 
 ## Environment
 
 - CLI: `mlx_whisper` (uv tool `mlx-whisper`, окружение изолировано, обновление: `uv tool upgrade mlx-whisper`)
-- Модель: **whisper-podlodka-turbo q8 (8 бит)** локально в
-  `~/.local/share/models/whisper-podlodka-turbo-MLX-q8/` (config.json + weights.safetensors, 824 МБ)
-  Источник: evilfreelancer/whisper-podlodka-turbo-MLX (q8/), база bond005/whisper-podlodka-turbo.
-  q8 быстрее fp16 при совпадении текста 99.8%. fp16 лежит рядом в
-  `~/.local/share/models/whisper-podlodka-turbo-MLX-fp16/` — передать путь явно через `--model`
-  (сырой CLI) / аргумент модели скриптов.
+- Модели — выбор АВТОМАТИЧЕСКИЙ по `--language` (оба скрипта), явный `--model` перекрывает:
+  - **ru → whisper-podlodka-turbo q8 (8 бит)** локально в
+    `~/.local/share/models/whisper-podlodka-turbo-MLX-q8/` (config.json + weights.safetensors, 824 МБ).
+    Источник: evilfreelancer/whisper-podlodka-turbo-MLX (q8/), база bond005/whisper-podlodka-turbo.
+    q8 быстрее fp16 при совпадении текста 99.8%. fp16 лежит рядом в
+    `~/.local/share/models/whisper-podlodka-turbo-MLX-fp16/` — передать путь явно через `--model`
+    (сырой CLI) / аргумент модели скриптов.
+  - **все остальные языки → whisper-large-v3-turbo-8bit** локально в
+    `~/.local/share/models/whisper-large-v3-turbo-8bit/` (config.json + weights.safetensors, ~809 МБ).
+    Источник: mlx-community/whisper-large-v3-turbo-8bit (файл model.safetensors сохранён как
+    weights.safetensors — такого имени ждёт mlx_whisper).
 - Тянет ffmpeg для декодирования не-wav аудио; wav 24k mono берёт как есть
 - Тест-эталон: 15.7 c русская речь → чистый текст за 4.6 c (RAM 1.85 ГБ)
 
 ## When to Use
 
 - «распознай/транскрибируй аудио/голосовое/запись» — любой локальный файл (wav/mp3/m4a/mp4/ogg)
-- русская и английская речь; длинные записи; нужны субтитры srt/vtt или таймстампы
-- Don't use for: диаризация спикеров (кто говорил), живые стримы, языки кроме ru/en (модель специализирована)
+- речь на любом языке (ru — podlodka q8, остальные — large-v3-turbo-8bit); длинные записи; нужны субтитры srt/vtt или таймстампы
+- Don't use for: диаризация спикеров (кто говорил), живые стримы
 
 ## Quick Reference
 
@@ -129,10 +136,12 @@ payload для коррекции (базовый текст, канон-тер�
   длительность, модель, коррекция терминов, время этапов); далее транскрипт блоками `**mm:ss**`.
   MD быстрого пути (`transcribe_to_md.py`) дополнительно содержит таблицу сегментов.
 
-**Сырой mlx_whisper** (когда MD не нужен — srt, перевод, отладка):
+**Сырой mlx_whisper** (когда MD не нужен — srt, перевод, отладка). Путь модели выбрать по
+языку: ru → `~/.local/share/models/whisper-podlodka-turbo-MLX-q8`, остальные →
+`~/.local/share/models/whisper-large-v3-turbo-8bit`:
 
 ```bash
-# субтитры + таймстампы слов
+# субтитры + таймстампы слов (пример для ru)
 mlx_whisper --model ~/.local/share/models/whisper-podlodka-turbo-MLX-q8 \
   --language ru --condition-on-previous-text False \
   --output-format srt --word-timestamps True --output-dir /tmp/stt <аудио>
@@ -173,6 +182,10 @@ mlx_whisper --model ~/.local/share/models/whisper-podlodka-turbo-MLX-q8 \
 ## Pitfalls
 
 - **Путь модели — папка, не HF-id**: с локальной папкой работает офлайн и без сюрпризов кэша HF.
+- **Модель выбирается по `--language` автоматически**: ru → podlodka q8, всё остальное →
+  whisper-large-v3-turbo-8bit; `--model <папка>` перекрывает выбор. Для не-ru языка папка
+  `~/.local/share/models/whisper-large-v3-turbo-8bit/` обязана существовать — иначе скрипт
+  упадёт на старте с понятной ошибкой (podlodka для не-ru не годится: она ru-специализирована).
 - `--language ru` указывать явно: без него Whisper детектит язык сам и на коротких клипах иногда ошибается.
 - Галлюцинации на тишине/музыке: повторяющиеся фразы = признак. Лечится `--condition-on-previous-text False`:
   в скриптах скилла включено всегда; в сырых вызовах передавать руками — убирает петли-повторы

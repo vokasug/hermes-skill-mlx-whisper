@@ -4,7 +4,7 @@
 
 ## Что умеет
 
-- **Локальный STT** — whisper-podlodka-turbo q8 (специализирована на русском, база bond005/whisper-podlodka-turbo, MLX-конверсия evilfreelancer); английский тоже поддерживается
+- **Локальный STT** — модель выбирается автоматически по языку: русский — whisper-podlodka-turbo q8 (специализирована на русском, база bond005/whisper-podlodka-turbo, MLX-конверсия evilfreelancer), все остальные языки — whisper-large-v3-turbo-8bit (mlx-community)
 - **Полный пайплайн `vad_transcribe.py`**: Silero VAD (паузы/шумы отрезаются) → нарезка на сегменты ≤28 с → Whisper → regex-препасс по словарю ослышек → payload для коррекции терминов
 - **Коррекция терминов по схеме «советчик + судья»** — советчиком выступает основная модель агента (никаких внешних API и ключей не нужно): скрипт пишет `<имя>.correct-payload.json` (базовый текст, канон-термины, low-confidence спаны, субтитры, инструкции), модель целиком правит текст в `<имя>.corrected.txt`, а `--apply-corrections` принимает или отклоняет правки детерминированными гейтами
 - **Субтитры как «второе мнение»** (`--subs file.srt`) — если к аудио есть субтитры (например, с YouTube), коррекция сверяет с ними ослышки, а из субтитров авто-извлекаются канон-термины. Принятие вывода советчика — два детерминированных гейта в коде: word-diff бюджет (никаких переписываний текста) и числовой гейт (числа всегда остаются от Whisper, попытки изменения откатываются и логируются)
@@ -35,6 +35,18 @@ curl -LO https://huggingface.co/evilfreelancer/whisper-podlodka-turbo-MLX/resolv
 ```
 
 Важно: модель передаётся в скрипты **путём к папке**, не HF-id — работает офлайн и без сюрпризов кэша HuggingFace. q8 быстрее fp16 при совпадении текста 99.8%. Если нужна максимальная точность или ещё меньше RAM — в том же репозитории есть `fp16/` и `q4/`.
+
+### 2b. Модель whisper-large-v3-turbo-8bit (~809 МБ) — для всех языков кроме русского
+
+```bash
+mkdir -p ~/.local/share/models/whisper-large-v3-turbo-8bit
+cd ~/.local/share/models/whisper-large-v3-turbo-8bit
+curl -LO https://huggingface.co/mlx-community/whisper-large-v3-turbo-8bit/resolve/main/config.json
+# в репозитории веса называются model.safetensors — сохраняем как weights.safetensors (такого имени ждёт mlx_whisper)
+curl -L -o weights.safetensors https://huggingface.co/mlx-community/whisper-large-v3-turbo-8bit/resolve/main/model.safetensors
+```
+
+Без этой папки транскрибация не-ru языков упадёт на старте с понятной ошибкой.
 
 ### 3. Окружение VAD-пайплайна
 
@@ -73,7 +85,7 @@ git clone https://github.com/vokasug/hermes-skill-mlx-whisper ~/.hermes/skills/m
   ~/.hermes/skills/media/mlx-whisper/scripts/vad_transcribe.py <аудио> [ещё...] --language ru
 ```
 
-- `--language ru` указывать явно — на коротких клипах авто-детект иногда ошибается
+- `--language ru` указывать явно — на коротких клипах авто-детект иногда ошибается. От языка зависит и модель: `ru` → podlodka q8, любой другой → whisper-large-v3-turbo-8bit; `--model <папка>` перекрывает автовыбор
 - `--no-correct` — пропустить подготовку коррекции (без payload)
 - `--terms "Имя, Ещё Имя"` — канонические написания терминов сверх встроенного словаря
 - `--subs <srt/vtt>` — субтитры того же контента как второе мнение для коррекции + авто-экстракция терминов из них

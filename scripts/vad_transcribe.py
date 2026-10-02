@@ -43,8 +43,18 @@ HOME = pathlib.Path.home()
 VAD_PY = HOME / ".local/share/stt-vad/venv/bin/python"
 VAD_SCRIPT = pathlib.Path(__file__).parent / "vad_segments.py"   # sibling in skill scripts/
 VAD_MODEL = HOME / ".local/share/models/silero-vad/silero_vad.onnx"
-DEFAULT_MODEL = str(HOME / ".local/share/models/whisper-podlodka-turbo-MLX-q8")
 OUT_DIR = HOME / "result-mlx-whisper"
+
+# Model by language: podlodka q8 is ru-specialized; every other language goes
+# to the multilingual whisper-large-v3-turbo-8bit.
+MODELS = {
+    "ru": HOME / ".local/share/models/whisper-podlodka-turbo-MLX-q8",
+}
+MODEL_FALLBACK = HOME / ".local/share/models/whisper-large-v3-turbo-8bit"
+
+
+def default_model_for_language(language: str) -> pathlib.Path:
+    return MODELS.get(language, MODEL_FALLBACK)
 
 MAX_SEG = 28.0
 GAP_MERGE = 0.25
@@ -641,7 +651,9 @@ def main():
                     help="judge step: verify advisor corrections with the deterministic gates "
                          "and rewrite the MD")
     ap.add_argument("--language", default="ru")
-    ap.add_argument("--model", default=DEFAULT_MODEL)
+    ap.add_argument("--model", default=None,
+                    help="model folder path; default: auto by --language "
+                         "(ru → podlodka q8, other → whisper-large-v3-turbo-8bit)")
     ap.add_argument("--terms", default="", help="extra canonical terms, comma-separated")
     ap.add_argument("--subs", default="", help="subtitle file (srt/vtt) as second opinion for correction")
     ap.add_argument("--no-correct", action="store_true", help="skip correction prep (no payload, regex-only text)")
@@ -672,6 +684,13 @@ def main():
         return
     if not args.audio:
         ap.error("нужны аудиофайлы или --apply-corrections PAYLOAD_JSON CORRECTED_TXT")
+
+    if args.model is None:
+        args.model = str(default_model_for_language(args.language))
+    if not pathlib.Path(args.model).is_dir():
+        sys.exit(f"error: папка модели не найдена: {args.model} "
+                 f"(выбор по языку '{args.language}'; скачайте по инструкции README "
+                 f"или передайте --model)")
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     for raw in args.audio:

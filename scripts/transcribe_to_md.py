@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Transcribe audio via mlx_whisper (podlodka-turbo q8) -> dated Markdown file.
+"""Transcribe audio via mlx_whisper (model auto by language: ru → podlodka q8,
+other → whisper-large-v3-turbo-8bit) -> dated Markdown file.
 
 Output: ~/result-mlx-whisper/YYYY-MM-DD_<audio-basename>.md
 Only stdlib + mlx_whisper CLI. Model lives in RAM only while mlx_whisper runs.
@@ -11,8 +12,15 @@ import pathlib
 import subprocess
 import tempfile
 
-MODEL = pathlib.Path.home() / ".local/share/models/whisper-podlodka-turbo-MLX-q8"
+MODELS = {
+    "ru": pathlib.Path.home() / ".local/share/models/whisper-podlodka-turbo-MLX-q8",
+}
+MODEL_FALLBACK = pathlib.Path.home() / ".local/share/models/whisper-large-v3-turbo-8bit"
 OUT_DIR = pathlib.Path.home() / "result-mlx-whisper"
+
+
+def default_model_for_language(language: str) -> pathlib.Path:
+    return MODELS.get(language, MODEL_FALLBACK)
 
 
 def ffprobe_duration(path: pathlib.Path):
@@ -55,7 +63,7 @@ def transcribe_one(src: pathlib.Path, model: str, language: str) -> pathlib.Path
         f"- **Дата:** {datetime.date.today().isoformat()}",
         f"- **Источник:** `{src}`",
         f"- **Длительность:** {fmt_ts(dur)}",
-        f"- **Модель:** {MODEL.name}, язык: {language}",
+        f"- **Модель:** {pathlib.Path(model).name}, язык: {language}",
         "",
         "## Текст",
         "",
@@ -76,8 +84,13 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("audio", nargs="+", help="audio/video file(s)")
     ap.add_argument("--language", default="ru")
-    ap.add_argument("--model", default=str(MODEL))
+    ap.add_argument("--model", default=None,
+                    help="model folder path; default: auto by --language "
+                         "(ru → podlodka q8, other → whisper-large-v3-turbo-8bit)")
     args = ap.parse_args()
+
+    if args.model is None:
+        args.model = str(default_model_for_language(args.language))
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     for raw in args.audio:
