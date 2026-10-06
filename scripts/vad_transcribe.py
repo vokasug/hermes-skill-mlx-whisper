@@ -8,18 +8,17 @@ Stages:
   1. VAD   (silero venv + onnx model)          -> speech intervals
   2. STT   (segments <=28s, one process, condition_on_previous_text=False)
   3. Correction prep: regex prepass (mishear dictionary) + junction fix. When canonical
-     terms or subtitles exist, writes <stem>.correct-payload.json next to the MD.
+     terms or subtitles exist, writes <stem>.base.json (base snapshot for the judge)
+     next to the MD.
 
 Correction is an advisor/judge loop with the MAIN AGENT MODEL as advisor:
   - advisor (main model): reads the finished MD transcript + the subtitle file (when
-    present) + the content description it already has in context, fixes mishearings and
-    term spelling, and writes an edit list -> <stem>.edits.json
-    ([{"old": ..., "new": ...}], "all": true replaces every occurrence);
-  - judge (this script):  --apply-edits PAYLOAD EDITS applies the edits to the payload's
-    base_text, then re-verifies the result with deterministic gates (word-diff budget;
-    positional numeric gate) and rewrites the MD. Rejected output leaves the MD on the
-    regex-only base. --check-edits runs the same pipeline without writing (preflight).
-    Legacy full-text mode --apply-corrections PAYLOAD CORRECTED_TXT is unchanged.
+    present) + the content description it already has in context, and edits the MD
+    IN PLACE with a patch tool — only mishearings and term spelling;
+  - judge (this script):  --verify BASE_JSON MD [--finalize] diffs the edited transcript
+    against the base snapshot with deterministic gates (block structure; word-diff
+    budget; numeric gate) — no writes, exit 1 with reasons on violation. On a clean
+    pass --finalize stamps the header correction line and writes <stem>.corrections.md.
 
 Rendering: transcript is cut into sentences (by terminal punctuation of the word stream), then
 sentences are grouped into ~60 s blocks — a new block starts at the sentence boundary nearest to
@@ -27,10 +26,9 @@ sentences are grouped into ~60 s blocks — a new block starts at the sentence b
 Deterministic; no model involved.
 
 Main output: ~/result-mlx-whisper/YYYY-MM-DD_<stem>.md  — readable transcript with timestamps.
-Sidecars (when applicable): <stem>.correct-payload.json (judge data), <stem>.edits.json,
-<stem>.corrected.txt (legacy), <stem>.corrections.md (applied change log),
-<stem>.segments.json (--debug-segments).
---no-correct skips stage 3 (no payload, regex-only text).
+Sidecars (when applicable): <stem>.base.json (judge data), <stem>.corrections.md
+(applied change log), <stem>.segments.json (--debug-segments).
+--no-correct skips stage 3 (no base snapshot, regex-only text).
 """
 import argparse
 import collections
@@ -225,20 +223,6 @@ def parse_subs(path: pathlib.Path) -> list[tuple[float, float, str]]:
     return cues
 
 
-def subs_for_range(cues: list, t0: float, t1: float, max_words: int = 700) -> str:
-    """Plain subtitle text overlapping [t0, t1] (5s padding), capped by word count."""
-    out, words = [], 0
-    for s, e, txt in cues:
-        if e < t0 - 5 or s > t1 + 5:
-            continue
-        w = len(txt.split())
-        if words + w > max_words:
-            break
-        out.append(txt)
-        words += w
-    return " ".join(out)
-
-
 def extract_terms_from_subs(sub_cues: list, draft_text: str, max_terms: int = 25) -> list[str]:
     """Auto canonical terms from subtitles: capitalized words (>=2 occurrences in subs)
     that the draft either lowercased or spelled similarly-but-wrong (fuzzy >=0.8).
@@ -304,18 +288,6 @@ def uncertain_spans(segments: list, max_spans: int = 40) -> list[str]:
             if s.get("logprob") is not None and s["logprob"] < LOGPROB_LOW][:max_spans]
 
 
-def verify_correction_out(pre_text: str, out: str) -> tuple | None:
-    """Acceptance gate. Allows replace opcodes of any span plus tiny insert/delete wiggle;
-    rejects on large drift. Returns (opcodes, base_words, out_words) or None.
-    Reject reason with numbers: verify_correction_diag()."""
-    return _verify(pre_text, out)[0]
-
-
-def verify_correction_diag(pre_text: str, out: str) -> str:
-    """Human-readable gate verdict with numbers: 'OK: ...' or 'REJECT: <причина>'."""
-    return _verify(pre_text, out)[1]
-
-
 def _verify(pre_text: str, out: str) -> tuple:
     rw, ow = pre_text.split(), out.split()
     budget = max(2, min(25, len(rw) // 100))
@@ -355,69 +327,70 @@ def redistribute_words(chunk: list, text: str) -> tuple[list, tuple | None]:
     return fixed, note
 
 
-def apply_corrections(payload: dict, corrected_text: str) -> dict:
-    """Judge: verify the advisor's corrected text against payload["base_text"] with the
-    deterministic gates (word-diff budget; positional numeric gate — any edit whose digit
-    tokens differ is rolled back to the base words in place). Returns a dict:
-    status "ok" with corrected segments/changes/rejected, or "rejected" with the base kept."""
-    base = payload["base_text"]
-    segments = payload["segments"]
-    ver = verify_correction_out(base, corrected_text)
+TS_LINE = re.compile(r"^\*\*(\d+:\d{2}(?::\d{2})?)\*\* (.*)$")
+
+
+def md_to_text(md_path: pathlib.Path) -> tuple[str, list]:
+    """Transcript body of an MD -> (plain word stream, block timestamps). Only
+    '**mm:ss** text' lines are read, so header edits never reach the gates."""
+    parts, ts = [], []
+    for line in pathlib.Path(md_path).read_text(encoding="utf-8").splitlines():
+        m = TS_LINE.match(line)
+        if m:
+            ts.append(m.group(1))
+            parts.append(m.group(2))
+    return " ".join(" ".join(parts).split()), ts
+
+
+def verify_mode(base_path: pathlib.Path, md_path: pathlib.Path, finalize: bool = False):
+    """Post-check (judge): the advisor (main model) edits the MD in place with a patch
+    tool; this mode diffs the edited transcript against the base snapshot with the
+    deterministic gates — block structure, word-diff budget, numeric gate. Nothing is
+    written unless --finalize: on a clean pass it stamps the header correction line
+    and writes <stem>.corrections.md. Exit 1 with reasons on any violation."""
+    base = json.loads(base_path.read_text(encoding="utf-8"))
+    text, ts = md_to_text(md_path)
+    if ts != base["ts_marks"]:
+        diff = next(((a, b) for a, b in zip(base["ts_marks"], ts) if a != b), None)
+        hint = f", первое расхождение: {diff[0]} -> {diff[1]}" if diff else ""
+        sys.exit(f"REJECT: структура блоков изменена (таймкодов было {len(base['ts_marks'])}, "
+                 f"стало {len(ts)}{hint}) — восстановите строки **mm:ss** в исходном виде")
+    ver, diag = _verify(base["base_text"], text)
+    print(diag)
     if ver is None:
-        return {"status": "rejected", "reason": verify_correction_diag(base, corrected_text),
-                "segments": segments, "changes": [], "rejected": [], "note": None}
+        sys.exit(1)
     ops, rw, ow = ver
-    final, changes, rejected = [], [], []
+    changes, rejected = [], []
     for tag, i1, i2, j1, j2 in ops:
         if tag == "equal":
-            final.extend(ow[j1:j2])
             continue
         a, b = " ".join(rw[i1:i2]), " ".join(ow[j1:j2])
-        if numeric_tokens(a) != numeric_tokens(b):
-            final.extend(rw[i1:i2])
-            rejected.append((a, b))
-        else:
-            final.extend(ow[j1:j2])
-            changes.append((a, b))
-    fixed, note = redistribute_words(segments, " ".join(final))
-    out_segments = [dict(s, text=fx) for s, fx in zip(segments, fixed)]
-    return {"status": "ok", "segments": out_segments, "changes": changes,
-            "rejected": rejected, "note": note}
-
-
-def apply_edit_list(base_text: str, edits: list) -> tuple:
-    """Apply advisor edits [{"old", "new", "all"?}] to the base word stream. Matching is
-    whitespace-normalized: the advisor copies `old` from the readable MD, where timestamps
-    and block breaks differ from the plain stream (timestamps themselves are forbidden in
-    `old` — an edit must not cross a block boundary). Per edit:
-    0 occurrences -> skipped; >1 occurrence without "all": true -> skipped as ambiguous
-    (needs a longer `old` or "all"); differing digit tokens -> skipped (the positional
-    numeric gate in apply_corrections would roll it back anyway; here the reason is
-    visible per edit). Returns (text, applied, skipped) with skipped = (old, new, reason)."""
-    text = " ".join(base_text.split())
-    applied, skipped = [], []
-    for e in edits:
-        old = " ".join(str(e.get("old", "")).split())
-        new = " ".join(str(e.get("new", "")).split())
-        if not old or old == new:
-            skipped.append((old, new, "пустой old или old == new"))
-            continue
-        if "**" in old:
-            skipped.append((old, new, "old содержит таймкод **mm:ss** — правка не должна пересекать блоки"))
-            continue
-        n = text.count(old)
-        if n == 0:
-            skipped.append((old, new, "old не найден в транскрипте"))
-            continue
-        if n > 1 and not e.get("all"):
-            skipped.append((old, new, f"old встречается {n} раз — нужен \"all\": true или более длинный контекст"))
-            continue
-        if numeric_tokens(old) != numeric_tokens(new):
-            skipped.append((old, new, "ОТКЛОНЕНО: числа"))
-            continue
-        text = text.replace(old, new)
-        applied.append((old, new))
-    return text, applied, skipped
+        (rejected if numeric_tokens(a) != numeric_tokens(b) else changes).append((a, b))
+    print(f"правок: {len(changes)}, отклонено числовым гейтом: {len(rejected)}")
+    for a, b in rejected:
+        print(f"  ОТКЛОНЕНО (числа): `{a}` -> `{b}` — откатите эту правку в MD и повторите --verify")
+    if rejected:
+        sys.exit(1)
+    if not finalize:
+        return
+    md_path = pathlib.Path(md_path)
+    lines = md_path.read_text(encoding="utf-8").splitlines()
+    corr = f"основная модель; канонов {len(base['canonical'])}, правок {len(changes)}"
+    lines = [f"- **Коррекция терминов:** {corr}" if ln.startswith("- **Коррекция терминов:**")
+             else ln for ln in lines]
+    md_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    print(f"OK {md_path}")
+    clines = [f"# Правки — {base['src_name']}", "",
+              "Советчик: основная модель агента — правки внесены прямо в MD. Пост-чек — "
+              "детерминированные гейты этого скрипта (структура блоков, word-diff бюджет, "
+              "числовой гейт).", ""]
+    for rule, n in base.get("regex_log", []):
+        clines.append(f"- `{rule}` ×{n} (regex, гарантированно)")
+    for a, b in changes:
+        clines.append(f"- `{a}` → `{b}`")
+    cpath = md_path.with_suffix(".corrections.md")
+    cpath.write_text("\n".join(clines) + "\n", encoding="utf-8")
+    print(f"OK {cpath}")
 
 
 def group_into_blocks(sents: list[dict], audio_end: float | None = None) -> list[list[dict]]:
@@ -569,7 +542,7 @@ def process_one(src: pathlib.Path, args):
         "subs_line": subs_line, "t_vad": t_vad, "t_stt": t_stt,
     }
 
-    canonical, regex_log, payload_path = [], [], None
+    canonical, regex_log, base_path = [], [], None
     if args.no_correct:
         fix_segment_junctions(segments)
         corr_line = "выключена (--no-correct)"
@@ -586,29 +559,18 @@ def process_one(src: pathlib.Path, args):
         if canonical or sub_cues:
             pre_text, pre_rules = regex_prepass(draft_text)
             regex_log = [[rule, n] for rule, n in pre_rules]
-            fixed, note = redistribute_words(segments, pre_text)
+            fixed, _note = redistribute_words(segments, pre_text)
             for s, fx in zip(segments, fixed):
                 s["text"] = fx
             fix_segment_junctions(segments)
-            base_text = " ".join(s["text"] for s in segments)
-            subs_text = (subs_for_range(sub_cues, segments[0]["start"], segments[-1]["end"],
-                                        max(700, int(draft_words * 1.2))) if sub_cues else "")
-            payload_path = out.with_name(out.stem + ".correct-payload.json")
-            edits_path = out.with_name(out.stem + ".edits.json")
-            payload = dict(info, version=1, out=str(out), segments=segments,
-                           base_text=base_text, canonical=canonical,
-                           spans=uncertain_spans(segments), subs_text=subs_text,
-                           regex_log=regex_log)
-            payload_path.write_text(json.dumps(payload, ensure_ascii=False, indent=1),
-                                    encoding="utf-8")
+            base_path = out.with_name(out.stem + ".base.json")
             src_note = " + субтитры-второе-мнение" if sub_cues else ""
             print(f"[3/3] Коррекция терминов: канонов {len(canonical)}{src_note}"
                   + (f": {', '.join(canonical)}" if canonical else ""), flush=True)
-            print(f"      payload → {payload_path}", flush=True)
-            print(f"      следующий шаг: основная модель читает MD ({out.name})"
-                  + (f" + субтитры ({args.subs})" if sub_cues else "")
-                  + f" и пишет правки → {edits_path.name}, затем --apply-edits", flush=True)
-            corr_line = f"payload `{payload_path.name}` — ожидает правок основной модели"
+            spans = uncertain_spans(segments)
+            if spans:
+                print(f"      низкоуверенные спаны ({len(spans)}): " + " | ".join(spans), flush=True)
+            corr_line = "regex-база — ожидает правок основной модели"
         else:
             fix_segment_junctions(segments)
             corr_line = "не потребовалась (терминов не найдено)"
@@ -617,8 +579,16 @@ def process_one(src: pathlib.Path, args):
     out.write_text("\n".join(build_md_lines(info, segments, corr_line)).rstrip() + "\n",
                    encoding="utf-8")
     print(f"OK {out}")
-    if payload_path:
-        print(f"PAYLOAD {payload_path}")
+    if base_path:
+        _txt, ts_marks = md_to_text(out)
+        base = dict(version=2, out=str(out), src_name=info["src_name"],
+                    base_text=" ".join(s["text"] for s in segments),
+                    canonical=canonical, regex_log=regex_log, ts_marks=ts_marks)
+        base_path.write_text(json.dumps(base, ensure_ascii=False, indent=1), encoding="utf-8")
+        print(f"BASE {base_path}")
+        print(f"      следующий шаг: основная модель правит {out.name} напрямую (patch)"
+              + (f" с опорой на субтитры ({args.subs})" if sub_cues else "")
+              + f", затем: --verify {base_path.name} {out.name} [--finalize]", flush=True)
 
     if args.debug_segments:
         spath = out.with_suffix(".segments.json")
@@ -627,99 +597,16 @@ def process_one(src: pathlib.Path, args):
         print(f"OK {spath}")
 
 
-def finish_apply(payload: dict, res: dict, src_label: str, skipped: list | None = None,
-                 numeric_skipped: int = 0):
-    """Shared tail of both apply modes: rewrite the MD (or mark rejection) and write the
-    corrections sidecar. `skipped` — edit-list entries that never reached the gates;
-    `numeric_skipped` — how many of them were numeric rejections (counted in the header
-    alongside gate-level numeric rollbacks)."""
-    out = pathlib.Path(payload["out"])
-    if res["status"] != "ok":
-        corr_line = f"ОТКЛОНЕНА верификацией ({res['reason']}) — текст оставлен без правок"
-        out.write_text("\n".join(build_md_lines(payload, payload["segments"], corr_line)).rstrip() + "\n",
-                       encoding="utf-8")
-        print(f"REJECTED {src_label}: {res['reason']}; MD без правок: {out}")
-        sys.exit(1)
-
-    changes, rejected = res["changes"], res["rejected"]
-    corr_line = f"основная модель; канонов {len(payload['canonical'])}, правок {len(changes)}"
-    if rejected or numeric_skipped:
-        corr_line += f", отклонено числовым гейтом: {len(rejected) + numeric_skipped}"
-    out.write_text("\n".join(build_md_lines(payload, res["segments"], corr_line)).rstrip() + "\n",
-                   encoding="utf-8")
-    print(f"OK {out}")
-
-    clines = [f"# Правки — {payload['src_name']}", "",
-              "Советчик: основная модель агента. Принятие каждой правки — детерминированные "
-              "гейты этого скрипта (word-diff бюджет, позиционный числовой гейт).", ""]
-    for rule, n in payload.get("regex_log", []):
-        clines.append(f"- `{rule}` ×{n} (regex, гарантированно)")
-    for a, b in changes:
-        clines.append(f"- `{a}` → `{b}`")
-    if res["note"]:
-        clines.append(f"- {res['note'][0]}: {res['note'][1]}")
-    if rejected:
-        clines += ["", "## Отклонено числовым гейтом", ""]
-        clines += [f"- `{a}` → `{b}` (ОТКЛОНЕНО: числа)" for a, b in rejected]
-    if skipped:
-        clines += ["", "## Пропущенные замены (не дошли до гейтов)", ""]
-        clines += [f"- `{a}` → `{b}` ({why})" for a, b, why in skipped]
-    cpath = out.with_suffix(".corrections.md")
-    cpath.write_text("\n".join(clines) + "\n", encoding="utf-8")
-    print(f"OK {cpath}")
-    if skipped:
-        print(f"ПРОПУЩЕНО замен: {len(skipped)}")
-        for a, b, why in skipped:
-            print(f"  - `{a}` → `{b}` ({why})")
-
-
-def apply_mode(payload_path: pathlib.Path, corrected_path: pathlib.Path):
-    payload = json.loads(payload_path.read_text(encoding="utf-8"))
-    corrected = corrected_path.read_text(encoding="utf-8").strip()
-    res = apply_corrections(payload, corrected)
-    finish_apply(payload, res, str(corrected_path))
-
-
-def edits_common(payload_path: pathlib.Path, edits_path: pathlib.Path) -> tuple:
-    payload = json.loads(payload_path.read_text(encoding="utf-8"))
-    edits = json.loads(edits_path.read_text(encoding="utf-8"))
-    if not isinstance(edits, list):
-        sys.exit(f"error: {edits_path} должен содержать JSON-список замен "
-                 '[{"old": ..., "new": ...}]')
-    corrected, applied, skipped = apply_edit_list(payload["base_text"], edits)
-    return payload, corrected, applied, skipped
-
-
-def check_edits_mode(payload_path: pathlib.Path, edits_path: pathlib.Path):
-    """Preflight: apply the edit list and report per-edit skips plus the gate verdict,
-    without writing anything."""
-    payload, corrected, applied, skipped = edits_common(payload_path, edits_path)
-    print(f"замен применится: {len(applied)}, пропущено: {len(skipped)}")
-    for a, b, why in skipped:
-        print(f"  ПРОПУСК: `{a}` → `{b}` ({why})")
-    print(vt_diag := verify_correction_diag(payload["base_text"], corrected))
-    if vt_diag.startswith("REJECT"):
-        sys.exit(1)
-
-
-def apply_edits_mode(payload_path: pathlib.Path, edits_path: pathlib.Path):
-    payload, corrected, _applied, skipped = edits_common(payload_path, edits_path)
-    res = apply_corrections(payload, corrected)
-    num_skip = sum(1 for _a, _b, why in skipped if why == "ОТКЛОНЕНО: числа")
-    finish_apply(payload, res, str(edits_path), skipped, num_skip)
-
-
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("audio", nargs="*")
-    ap.add_argument("--apply-corrections", nargs=2, metavar=("PAYLOAD_JSON", "CORRECTED_TXT"),
-                    help="judge step (legacy full-text): verify advisor corrections with the "
-                         "deterministic gates and rewrite the MD")
-    ap.add_argument("--apply-edits", nargs=2, metavar=("PAYLOAD_JSON", "EDITS_JSON"),
-                    help="judge step: apply the advisor edit list to the base text, verify "
-                         "with the deterministic gates and rewrite the MD")
-    ap.add_argument("--check-edits", nargs=2, metavar=("PAYLOAD_JSON", "EDITS_JSON"),
-                    help="preflight: report per-edit skips and the gate verdict, no writes")
+    ap.add_argument("--verify", nargs=2, metavar=("BASE_JSON", "MD"),
+                    help="judge step (post-check): verify advisor edits made directly in the "
+                         "MD against the base snapshot (block structure, word-diff budget, "
+                         "numeric gate); no writes, exit 1 with reasons on violation")
+    ap.add_argument("--finalize", action="store_true",
+                    help="with --verify: on a clean pass stamp the header correction line "
+                         "and write <stem>.corrections.md")
     ap.add_argument("--language", default="ru")
     ap.add_argument("--model", default=None,
                     help="model folder path; default: auto by --language "
@@ -744,24 +631,16 @@ def main():
                          "пустые метаданные запрещены; запросите значение у пользователя")
             setattr(args, name, v)
 
-    if args.apply_corrections:
-        p, c = (pathlib.Path(x).expanduser() for x in args.apply_corrections)
-        if not p.exists():
-            sys.exit(f"error: payload not found: {p}")
-        if not c.exists():
-            sys.exit(f"error: corrected text not found: {c}")
-        apply_mode(p, c)
-        return
-    if args.apply_edits or args.check_edits:
-        p, c = (pathlib.Path(x).expanduser() for x in (args.apply_edits or args.check_edits))
-        if not p.exists():
-            sys.exit(f"error: payload not found: {p}")
-        if not c.exists():
-            sys.exit(f"error: edits file not found: {c}")
-        (apply_edits_mode if args.apply_edits else check_edits_mode)(p, c)
+    if args.verify:
+        b, m = (pathlib.Path(x).expanduser() for x in args.verify)
+        if not b.exists():
+            sys.exit(f"error: base snapshot not found: {b}")
+        if not m.exists():
+            sys.exit(f"error: MD not found: {m}")
+        verify_mode(b, m, finalize=args.finalize)
         return
     if not args.audio:
-        ap.error("нужны аудиофайлы или --apply-edits PAYLOAD_JSON EDITS_JSON")
+        ap.error("нужны аудиофайлы или --verify BASE_JSON MD [--finalize]")
 
     if args.model is None:
         args.model = str(default_model_for_language(args.language))
