@@ -1,7 +1,7 @@
 ---
 name: mlx-whisper
 description: local speech-to-text via mlx whisper
-version: 1.6.0
+version: 1.6.1
 author: vokasug, Hermes Agent
 license: MIT
 platforms: [macos]
@@ -34,6 +34,7 @@ metadata:
     Источник: mlx-community/whisper-large-v3-turbo-8bit (файл model.safetensors сохранён как
     weights.safetensors — такого имени ждёт mlx_whisper).
 - Тянет ffmpeg для декодирования не-wav аудио; wav 24k mono берёт как есть
+- **Пути**: `$HERMES_HOME` — корень активного профиля Hermes (env-переменная, раскрывается shell-ом, профиль-независима); скрипты скилла — `$HERMES_HOME/skills/media/mlx-whisper/scripts/`
 - Тест-эталон: 15.7 c русская речь → чистый текст за 4.6 c (RAM 1.85 ГБ)
 
 ## When to Use
@@ -49,7 +50,7 @@ metadata:
 ```bash
 # 1) транскрибация: VAD → STT → regex-препасс → MD + base-снапшот для пост-чека
 ~/.local/share/uv/tools/mlx-whisper/bin/python \
-  ~/.hermes/skills/media/mlx-whisper/scripts/vad_transcribe.py <аудио> [ещё...] --language ru
+  $HERMES_HOME/skills/media/mlx-whisper/scripts/vad_transcribe.py <аудио> [ещё...] --language ru
 # результат: ~/result-mlx-whisper/YYYY-MM-DD_<имя-аудио>.md
 #   + рядом <имя>.base.json (только когда есть канон-термины или субтитры)
 #   и строка BASE <путь> в выводе
@@ -63,11 +64,11 @@ metadata:
 #    трогать; числа — всегда из транскрипта (числовой гейт иначе отклонит).
 #    Пост-чек (гейты, ничего не пишет; exit 1 = нарушение с причиной и цифрами):
 ~/.local/share/uv/tools/mlx-whisper/bin/python \
-  ~/.hermes/skills/media/mlx-whisper/scripts/vad_transcribe.py \
+  $HERMES_HOME/skills/media/mlx-whisper/scripts/vad_transcribe.py \
   --verify <имя>.base.json <имя>.md
 #    финализация (только после чистого прохода): штамп шапки + <имя>.corrections.md
 ~/.local/share/uv/tools/mlx-whisper/bin/python \
-  ~/.hermes/skills/media/mlx-whisper/scripts/vad_transcribe.py \
+  $HERMES_HOME/skills/media/mlx-whisper/scripts/vad_transcribe.py \
   --verify <имя>.base.json <имя>.md --finalize
 # exit 1 → причина в выводе: «REJECT: баланс слов…»/«вставка N слов подряд» (word-diff
 # бюджет), «ОТКЛОНЕНО (числа): a -> b» (числовой гейт — откатить эти правки patch-ем),
@@ -139,7 +140,7 @@ MD на диск + base-снапшот для судьи (снапшот — э�
   грамматику, не конвертировать числа между словами и цифрами. Низкоуверенные спаны
   Whisper (logprob < −0.7) скрипт печатает в stdout при транскрибации — первые кандидаты
   на ослышки; не перечисленные спаны высокоуверенные.
-- Быстрый MD без коррекции и VAD: `python3 ~/.hermes/skills/media/mlx-whisper/scripts/transcribe_to_md.py <аудио>`
+- Быстрый MD без коррекции и VAD: `python3 $HERMES_HOME/skills/media/mlx-whisper/scripts/transcribe_to_md.py <аудио>`
 - Основной MD-файл: шапка = блок контент-метаданных (название, автор, дата публикации, ссылка —
   всегда, см. `--meta-*` выше) + пустая строка + технические метаданные (дата, источник, субтитры,
   длительность, модель, коррекция терминов, время этапов); далее транскрипт блоками `**mm:ss**`.
@@ -189,7 +190,7 @@ STT-стек как общий. Стабильные контракты:
 
 1. Определить, что скачиваем (видео/mp3/плейлист/субтитры). Основной путь — скрипт `vad_transcribe.py`
    (VAD → STT → подготовка коррекции, датированный MD в `~/result-mlx-whisper/`).
-2. Запустить: `~/.local/share/uv/tools/mlx-whisper/bin/python ~/.hermes/skills/media/mlx-whisper/scripts/vad_transcribe.py <аудио> --language ru`;
+2. Запустить: `~/.local/share/uv/tools/mlx-whisper/bin/python $HERMES_HOME/skills/media/mlx-whisper/scripts/vad_transcribe.py <аудио> --language ru`;
    для длинных файлов — `terminal(background=true, notify_on_complete=true)` + `process wait`.
    Без `notify_on_complete=true` процесс завершится молча, а окно `wait` зажимается до 180 с —
    длинную транскрипцию придётся опрашивать несколькими заходами. Скрипт печатает прогресс по этапам и `OK <путь>`.
@@ -246,7 +247,7 @@ STT-стек как общий. Стабильные контракты:
 
 ## Verification
 
-0. Офлайн-тесты гейтов коррекции (без аудио и модели): `~/.local/share/uv/tools/mlx-whisper/bin/python ~/.hermes/skills/media/mlx-whisper/tests/test_gates.py` → `ALL TESTS OK`. Прогонять после любой правки _verify/md_to_text/verify_mode/числового гейта/redistribute_words/build_md_lines.
+0. Офлайн-тесты гейтов коррекции (без аудио и модели): `~/.local/share/uv/tools/mlx-whisper/bin/python $HERMES_HOME/skills/media/mlx-whisper/tests/test_gates.py` → `ALL TESTS OK`. Прогонять после любой правки _verify/md_to_text/verify_mode/числового гейта/redistribute_words/build_md_lines.
 
 1. Скрипт напечатал `OK ~/result-mlx-whisper/YYYY-MM-DD_<имя>.md`; файл существует и непустой (`read_file`): шапка с блоком контент-метаданных (Название/Автор/Дата публикации/Ссылка) и техническими метаданными (дата, источник, субтитры, длительность, модель, коррекция терминов, время) и транскрипт блоками `**mm:ss** текст` с пустой строкой после каждого блока. Если была строка `BASE` — шаг коррекции выполнен (шаг 3 Procedure) и шапка обновлена (`основная модель; канонов N, правок M`).
 2. Имя файла начинается с сегодняшней даты `YYYY-MM-DD_`.

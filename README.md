@@ -63,15 +63,15 @@ curl -L -o ~/.local/share/models/silero-vad/silero_vad.onnx \
 ### 4. Скилл в Hermes Agent
 
 ```bash
-mkdir -p ~/.hermes/skills/media
-git clone https://github.com/vokasug/hermes-skill-mlx-whisper ~/.hermes/skills/media/mlx-whisper
+mkdir -p $HERMES_HOME/skills/media
+git clone https://github.com/vokasug/hermes-skill-mlx-whisper $HERMES_HOME/skills/media/mlx-whisper
 ```
 
 ### 5. Проверка
 
 ```bash
 ~/.local/share/uv/tools/mlx-whisper/bin/python \
-  ~/.hermes/skills/media/mlx-whisper/scripts/vad_transcribe.py <аудио-файл> --language ru
+  $HERMES_HOME/skills/media/mlx-whisper/scripts/vad_transcribe.py <аудио-файл> --language ru
 ```
 
 Результат: `~/result-mlx-whisper/YYYY-MM-DD_<имя>.md`.
@@ -82,7 +82,7 @@ git clone https://github.com/vokasug/hermes-skill-mlx-whisper ~/.hermes/skills/m
 
 ```bash
 ~/.local/share/uv/tools/mlx-whisper/bin/python \
-  ~/.hermes/skills/media/mlx-whisper/scripts/vad_transcribe.py <аудио> [ещё...] --language ru
+  $HERMES_HOME/skills/media/mlx-whisper/scripts/vad_transcribe.py <аудио> [ещё...] --language ru
 ```
 
 - `--language ru` указывать явно — на коротких клипах авто-детект иногда ошибается. От языка зависит и модель: `ru` → podlodka q8, любой другой → whisper-large-v3-turbo-8bit; `--model <папка>` перекрывает автовыбор
@@ -94,7 +94,7 @@ git clone https://github.com/vokasug/hermes-skill-mlx-whisper ~/.hermes/skills/m
 Быстрый MD без VAD и коррекции:
 
 ```bash
-python3 ~/.hermes/skills/media/mlx-whisper/scripts/transcribe_to_md.py <аудио>
+python3 $HERMES_HOME/skills/media/mlx-whisper/scripts/transcribe_to_md.py <аудио>
 ```
 
 Сырой mlx_whisper (srt, перевод, отладка):
