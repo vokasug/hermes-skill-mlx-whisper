@@ -1,7 +1,7 @@
 ---
 name: mlx-whisper
 description: local speech-to-text via mlx whisper
-version: 1.6.1
+version: 1.6.2
 author: vokasug, Hermes Agent
 license: MIT
 platforms: [macos]
@@ -162,13 +162,15 @@ mlx_whisper --model ~/.local/share/models/whisper-podlodka-turbo-MLX-q8 \
 # промпт-контекст для имён/терминов: --initial-prompt "..." (термины НЕ исправляет, только стиль)
 ```
 
-## Машинное потребление другими скиллами
+## Выходные артефакты (контракт для других скиллов)
 
-Скиллы `multilingual-audio-replacement` и `translated-video-subtitles` используют этот
-STT-стек как общий. Стабильные контракты:
+Другие скиллы (напр. `multilingual-audio-replacement`, `translated-video-subtitles`)
+получают STT через загрузку этого скилла (`skill_view media/mlx-whisper`) и запуск по
+его Quick Reference — скрипты этого скилла чужими скиллами напрямую не вызываются.
+Ниже — стабильный контракт ВЫХОДНЫХ артефактов и семантики:
 
-- **Сегменты JSON (для пайплайнов):** `vad_transcribe.py <аудио> --language <code>
-  --no-correct --debug-segments` → рядом с MD пишется
+- **Сегменты JSON (для пайплайнов):** запуск по Quick Reference с флагами
+  `--language <code> --no-correct --debug-segments` → рядом с MD пишется
   `~/result-mlx-whisper/YYYY-MM-DD_<имя>.segments.json`:
   `{"file": ..., "segments": [{"start", "end", "text", "logprob"}, ...]}` — сегменты
   VAD-пайплайна с таймингами в секундах и avg_logprob Whisper. Путь не настраивается.
