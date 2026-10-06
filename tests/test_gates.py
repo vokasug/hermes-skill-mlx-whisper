@@ -107,4 +107,57 @@ md = (tmp / "t.md").read_text(encoding="utf-8")
 assert "ОТКЛОНЕНА верификацией" in md, md
 assert "alpha astro beta" in md, md
 
+# 8. apply_edit_list: базовая замена
+txt, app, skip = vt.apply_edit_list("alpha astro beta gamma",
+                                    [{"old": "astro", "new": "Astra"}])
+assert txt == "alpha Astra beta gamma" and len(app) == 1 and not skip, (txt, app, skip)
+
+# 9. apply_edit_list: old не найден -> пропуск с причиной
+txt, app, skip = vt.apply_edit_list("alpha beta", [{"old": "zzz", "new": "yyy"}])
+assert txt == "alpha beta" and not app and "не найден" in skip[0][2], (txt, app, skip)
+
+# 10. apply_edit_list: неоднозначный old без all -> пропуск; с all -> обе замены
+txt, app, skip = vt.apply_edit_list("орнит и орнит", [{"old": "орнит", "new": "Ornith"}])
+assert txt == "орнит и орнит" and not app and "встречается 2 раз" in skip[0][2], (txt, app, skip)
+txt, app, skip = vt.apply_edit_list("орнит и орнит", [{"old": "орнит", "new": "Ornith", "all": True}])
+assert txt == "Ornith и Ornith" and len(app) == 1 and not skip, (txt, app, skip)
+
+# 11. apply_edit_list: числовое изменение -> пропуск до гейтов
+txt, app, skip = vt.apply_edit_list("версия полтора вышла", [{"old": "полтора", "new": "1.5"}])
+assert txt == "версия полтора вышла" and "ОТКЛОНЕНО: числа" in skip[0][2], (txt, app, skip)
+
+# 12. apply_edit_list: нормализация пробелов (old скопирован из MD с переносами)
+txt, app, skip = vt.apply_edit_list("alpha astro beta",
+                                    [{"old": "alpha   astro\nbeta", "new": "alpha Astra beta"}])
+assert txt == "alpha Astra beta" and len(app) == 1, (txt, app, skip)
+
+# 13. apply_edit_list: таймкод в old запрещён (правка через границу блока)
+txt, app, skip = vt.apply_edit_list("alpha beta", [{"old": "alpha **01:00** beta", "new": "x"}])
+assert "таймкод" in skip[0][2], skip
+
+# 14/15. --apply-edits end-to-end через CLI
+e_json = tmp / "t.edits.json"
+e_json.write_text(json.dumps([{"old": "astro", "new": "Astra"},
+                              {"old": "zzz", "new": "yyy"}], ensure_ascii=False), encoding="utf-8")
+r = subprocess.run([sys.executable, str(SCRIPT), "--check-edits", str(p_json), str(e_json)],
+                   capture_output=True, text=True)
+assert r.returncode == 0, r.stderr + r.stdout
+assert "замен применится: 1, пропущено: 1" in r.stdout, r.stdout
+r = subprocess.run([sys.executable, str(SCRIPT), "--apply-edits", str(p_json), str(e_json)],
+                   capture_output=True, text=True)
+assert r.returncode == 0, r.stderr + r.stdout
+md = (tmp / "t.md").read_text(encoding="utf-8")
+assert "alpha Astra beta" in md and "правок 1" in md, md
+side = (tmp / "t.corrections.md").read_text(encoding="utf-8")
+assert "Пропущенные замены" in side and "old не найден" in side, side
+
+# 15. --apply-edits с выводом за гейтами: вставка >3 слов подряд -> exit 1, база цела
+e_json.write_text(json.dumps([{"old": "beta", "new": "beta plus five more extra words here"}]),
+                  encoding="utf-8")
+r = subprocess.run([sys.executable, str(SCRIPT), "--apply-edits", str(p_json), str(e_json)],
+                   capture_output=True, text=True)
+assert r.returncode == 1, (r.returncode, r.stdout, r.stderr)
+md = (tmp / "t.md").read_text(encoding="utf-8")
+assert "ОТКЛОНЕНА верификацией" in md and "alpha astro beta" in md, md
+
 print("ALL TESTS OK")

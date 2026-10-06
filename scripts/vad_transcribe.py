@@ -11,11 +11,15 @@ Stages:
      terms or subtitles exist, writes <stem>.correct-payload.json next to the MD.
 
 Correction is an advisor/judge loop with the MAIN AGENT MODEL as advisor:
-  - advisor (main model): rewrites the payload's base_text fixing only mishearings and term
-    spelling -> <stem>.corrected.txt (full text, whole transcript at once);
-  - judge (this script):  --apply-corrections PAYLOAD CORRECTED re-verifies the output with
-    deterministic gates (word-diff budget; positional numeric gate) and rewrites the MD.
-    Rejected output leaves the MD on the regex-only base.
+  - advisor (main model): reads the finished MD transcript + the subtitle file (when
+    present) + the content description it already has in context, fixes mishearings and
+    term spelling, and writes an edit list -> <stem>.edits.json
+    ([{"old": ..., "new": ...}], "all": true replaces every occurrence);
+  - judge (this script):  --apply-edits PAYLOAD EDITS applies the edits to the payload's
+    base_text, then re-verifies the result with deterministic gates (word-diff budget;
+    positional numeric gate) and rewrites the MD. Rejected output leaves the MD on the
+    regex-only base. --check-edits runs the same pipeline without writing (preflight).
+    Legacy full-text mode --apply-corrections PAYLOAD CORRECTED_TXT is unchanged.
 
 Rendering: transcript is cut into sentences (by terminal punctuation of the word stream), then
 sentences are grouped into ~60 s blocks — a new block starts at the sentence boundary nearest to
@@ -23,8 +27,9 @@ sentences are grouped into ~60 s blocks — a new block starts at the sentence b
 Deterministic; no model involved.
 
 Main output: ~/result-mlx-whisper/YYYY-MM-DD_<stem>.md  — readable transcript with timestamps.
-Sidecars (when applicable): <stem>.correct-payload.json, <stem>.corrected.txt,
-<stem>.corrections.md (applied change log), <stem>.segments.json (--debug-segments).
+Sidecars (when applicable): <stem>.correct-payload.json (judge data), <stem>.edits.json,
+<stem>.corrected.txt (legacy), <stem>.corrections.md (applied change log),
+<stem>.segments.json (--debug-segments).
 --no-correct skips stage 3 (no payload, regex-only text).
 """
 import argparse
@@ -82,29 +87,9 @@ LOWER_STARTERS = {
     "как", "в", "на", "с", "для", "к", "по", "у", "за", "от", "там", "тут", "ещё", "тоже",
 }
 
-# Instructions embedded into every correction payload — the advisor (main agent model)
-# reads them from the payload file itself, so the payload is self-contained.
-CORRECTOR_INSTRUCTIONS = """\
-You are correcting a speech-to-text transcript. This payload gives you:
-- base_text: BASE TRANSCRIPT (Whisper, local model) — its word stream, word order and
-  structure are authoritative;
-- canonical: canonical spellings of terms that must be fixed;
-- spans: LOW-CONFIDENCE BASE SPANS — places where Whisper itself reported uncertainty;
-  these are the prime suspects for mishearings. Every span NOT listed was recognized
-  with high confidence;
-- subs_text (may be empty): ALT-TRANSCRIPT (auto-captions) — a SECOND OPINION, NOT a
-  reference and NOT necessarily accurate. It has its own systematic errors (numbers often
-  mangled, words dropped or merged). Never trust it over the base without a knowledge-based
-  reason.
-Decide each divergence on its merits: if your own knowledge (technical terms, brands,
-product names, version numbers) tells you the correct form — use it. Where knowledge does
-not help and Whisper was confident about the span — prefer the base.
-Fix ONLY clear mishearings and wrong spellings/casing of terms, including the canonical
-list. WHEN IN DOUBT, KEEP THE BASE TEXT UNCHANGED.
-Rules: (1) The base word stream is preserved: replace words in place; never add, drop,
-merge or reorder words. (2) Do NOT rephrase or restyle. (3) Do NOT change punctuation or
-grammar. (4) Numbers: keep the base transcript's numeric forms exactly; never convert
-between words and digits. (5) Output ONLY the full corrected base text, no comments."""
+# The correction payload is judge-side data (segments + base_text for gates and MD
+# rebuild). The advisor model never reads it: it works from the finished MD, the
+# subtitle file and the content description it already has in context.
 
 
 def fmt_ts(sec) -> str:
@@ -400,6 +385,41 @@ def apply_corrections(payload: dict, corrected_text: str) -> dict:
             "rejected": rejected, "note": note}
 
 
+def apply_edit_list(base_text: str, edits: list) -> tuple:
+    """Apply advisor edits [{"old", "new", "all"?}] to the base word stream. Matching is
+    whitespace-normalized: the advisor copies `old` from the readable MD, where timestamps
+    and block breaks differ from the plain stream (timestamps themselves are forbidden in
+    `old` — an edit must not cross a block boundary). Per edit:
+    0 occurrences -> skipped; >1 occurrence without "all": true -> skipped as ambiguous
+    (needs a longer `old` or "all"); differing digit tokens -> skipped (the positional
+    numeric gate in apply_corrections would roll it back anyway; here the reason is
+    visible per edit). Returns (text, applied, skipped) with skipped = (old, new, reason)."""
+    text = " ".join(base_text.split())
+    applied, skipped = [], []
+    for e in edits:
+        old = " ".join(str(e.get("old", "")).split())
+        new = " ".join(str(e.get("new", "")).split())
+        if not old or old == new:
+            skipped.append((old, new, "пустой old или old == new"))
+            continue
+        if "**" in old:
+            skipped.append((old, new, "old содержит таймкод **mm:ss** — правка не должна пересекать блоки"))
+            continue
+        n = text.count(old)
+        if n == 0:
+            skipped.append((old, new, "old не найден в транскрипте"))
+            continue
+        if n > 1 and not e.get("all"):
+            skipped.append((old, new, f"old встречается {n} раз — нужен \"all\": true или более длинный контекст"))
+            continue
+        if numeric_tokens(old) != numeric_tokens(new):
+            skipped.append((old, new, "ОТКЛОНЕНО: числа"))
+            continue
+        text = text.replace(old, new)
+        applied.append((old, new))
+    return text, applied, skipped
+
+
 def group_into_blocks(sents: list[dict], audio_end: float | None = None) -> list[list[dict]]:
     """Group sentences into ~PARA_TARGET_S blocks: a new block starts at the sentence
     boundary NEAREST to (block start + PARA_TARGET_S) — the distance |start - target|
@@ -574,19 +594,20 @@ def process_one(src: pathlib.Path, args):
             subs_text = (subs_for_range(sub_cues, segments[0]["start"], segments[-1]["end"],
                                         max(700, int(draft_words * 1.2))) if sub_cues else "")
             payload_path = out.with_name(out.stem + ".correct-payload.json")
-            corrected_path = out.with_name(out.stem + ".corrected.txt")
+            edits_path = out.with_name(out.stem + ".edits.json")
             payload = dict(info, version=1, out=str(out), segments=segments,
                            base_text=base_text, canonical=canonical,
                            spans=uncertain_spans(segments), subs_text=subs_text,
-                           regex_log=regex_log, instructions=CORRECTOR_INSTRUCTIONS)
+                           regex_log=regex_log)
             payload_path.write_text(json.dumps(payload, ensure_ascii=False, indent=1),
                                     encoding="utf-8")
             src_note = " + субтитры-второе-мнение" if sub_cues else ""
             print(f"[3/3] Коррекция терминов: канонов {len(canonical)}{src_note}"
                   + (f": {', '.join(canonical)}" if canonical else ""), flush=True)
             print(f"      payload → {payload_path}", flush=True)
-            print(f"      следующий шаг: основная модель правит base_text → {corrected_path.name}, "
-                  f"затем --apply-corrections", flush=True)
+            print(f"      следующий шаг: основная модель читает MD ({out.name})"
+                  + (f" + субтитры ({args.subs})" if sub_cues else "")
+                  + f" и пишет правки → {edits_path.name}, затем --apply-edits", flush=True)
             corr_line = f"payload `{payload_path.name}` — ожидает правок основной модели"
         else:
             fix_segment_junctions(segments)
@@ -606,23 +627,24 @@ def process_one(src: pathlib.Path, args):
         print(f"OK {spath}")
 
 
-def apply_mode(payload_path: pathlib.Path, corrected_path: pathlib.Path):
-    payload = json.loads(payload_path.read_text(encoding="utf-8"))
-    corrected = corrected_path.read_text(encoding="utf-8").strip()
-    res = apply_corrections(payload, corrected)
+def finish_apply(payload: dict, res: dict, src_label: str, skipped: list | None = None,
+                 numeric_skipped: int = 0):
+    """Shared tail of both apply modes: rewrite the MD (or mark rejection) and write the
+    corrections sidecar. `skipped` — edit-list entries that never reached the gates;
+    `numeric_skipped` — how many of them were numeric rejections (counted in the header
+    alongside gate-level numeric rollbacks)."""
     out = pathlib.Path(payload["out"])
-
     if res["status"] != "ok":
         corr_line = f"ОТКЛОНЕНА верификацией ({res['reason']}) — текст оставлен без правок"
         out.write_text("\n".join(build_md_lines(payload, payload["segments"], corr_line)).rstrip() + "\n",
                        encoding="utf-8")
-        print(f"REJECTED {corrected_path}: {res['reason']}; MD без правок: {out}")
+        print(f"REJECTED {src_label}: {res['reason']}; MD без правок: {out}")
         sys.exit(1)
 
     changes, rejected = res["changes"], res["rejected"]
     corr_line = f"основная модель; канонов {len(payload['canonical'])}, правок {len(changes)}"
-    if rejected:
-        corr_line += f", отклонено числовым гейтом: {len(rejected)}"
+    if rejected or numeric_skipped:
+        corr_line += f", отклонено числовым гейтом: {len(rejected) + numeric_skipped}"
     out.write_text("\n".join(build_md_lines(payload, res["segments"], corr_line)).rstrip() + "\n",
                    encoding="utf-8")
     print(f"OK {out}")
@@ -639,17 +661,65 @@ def apply_mode(payload_path: pathlib.Path, corrected_path: pathlib.Path):
     if rejected:
         clines += ["", "## Отклонено числовым гейтом", ""]
         clines += [f"- `{a}` → `{b}` (ОТКЛОНЕНО: числа)" for a, b in rejected]
+    if skipped:
+        clines += ["", "## Пропущенные замены (не дошли до гейтов)", ""]
+        clines += [f"- `{a}` → `{b}` ({why})" for a, b, why in skipped]
     cpath = out.with_suffix(".corrections.md")
     cpath.write_text("\n".join(clines) + "\n", encoding="utf-8")
     print(f"OK {cpath}")
+    if skipped:
+        print(f"ПРОПУЩЕНО замен: {len(skipped)}")
+        for a, b, why in skipped:
+            print(f"  - `{a}` → `{b}` ({why})")
+
+
+def apply_mode(payload_path: pathlib.Path, corrected_path: pathlib.Path):
+    payload = json.loads(payload_path.read_text(encoding="utf-8"))
+    corrected = corrected_path.read_text(encoding="utf-8").strip()
+    res = apply_corrections(payload, corrected)
+    finish_apply(payload, res, str(corrected_path))
+
+
+def edits_common(payload_path: pathlib.Path, edits_path: pathlib.Path) -> tuple:
+    payload = json.loads(payload_path.read_text(encoding="utf-8"))
+    edits = json.loads(edits_path.read_text(encoding="utf-8"))
+    if not isinstance(edits, list):
+        sys.exit(f"error: {edits_path} должен содержать JSON-список замен "
+                 '[{"old": ..., "new": ...}]')
+    corrected, applied, skipped = apply_edit_list(payload["base_text"], edits)
+    return payload, corrected, applied, skipped
+
+
+def check_edits_mode(payload_path: pathlib.Path, edits_path: pathlib.Path):
+    """Preflight: apply the edit list and report per-edit skips plus the gate verdict,
+    without writing anything."""
+    payload, corrected, applied, skipped = edits_common(payload_path, edits_path)
+    print(f"замен применится: {len(applied)}, пропущено: {len(skipped)}")
+    for a, b, why in skipped:
+        print(f"  ПРОПУСК: `{a}` → `{b}` ({why})")
+    print(vt_diag := verify_correction_diag(payload["base_text"], corrected))
+    if vt_diag.startswith("REJECT"):
+        sys.exit(1)
+
+
+def apply_edits_mode(payload_path: pathlib.Path, edits_path: pathlib.Path):
+    payload, corrected, _applied, skipped = edits_common(payload_path, edits_path)
+    res = apply_corrections(payload, corrected)
+    num_skip = sum(1 for _a, _b, why in skipped if why == "ОТКЛОНЕНО: числа")
+    finish_apply(payload, res, str(edits_path), skipped, num_skip)
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("audio", nargs="*")
     ap.add_argument("--apply-corrections", nargs=2, metavar=("PAYLOAD_JSON", "CORRECTED_TXT"),
-                    help="judge step: verify advisor corrections with the deterministic gates "
-                         "and rewrite the MD")
+                    help="judge step (legacy full-text): verify advisor corrections with the "
+                         "deterministic gates and rewrite the MD")
+    ap.add_argument("--apply-edits", nargs=2, metavar=("PAYLOAD_JSON", "EDITS_JSON"),
+                    help="judge step: apply the advisor edit list to the base text, verify "
+                         "with the deterministic gates and rewrite the MD")
+    ap.add_argument("--check-edits", nargs=2, metavar=("PAYLOAD_JSON", "EDITS_JSON"),
+                    help="preflight: report per-edit skips and the gate verdict, no writes")
     ap.add_argument("--language", default="ru")
     ap.add_argument("--model", default=None,
                     help="model folder path; default: auto by --language "
@@ -682,8 +752,16 @@ def main():
             sys.exit(f"error: corrected text not found: {c}")
         apply_mode(p, c)
         return
+    if args.apply_edits or args.check_edits:
+        p, c = (pathlib.Path(x).expanduser() for x in (args.apply_edits or args.check_edits))
+        if not p.exists():
+            sys.exit(f"error: payload not found: {p}")
+        if not c.exists():
+            sys.exit(f"error: edits file not found: {c}")
+        (apply_edits_mode if args.apply_edits else check_edits_mode)(p, c)
+        return
     if not args.audio:
-        ap.error("нужны аудиофайлы или --apply-corrections PAYLOAD_JSON CORRECTED_TXT")
+        ap.error("нужны аудиофайлы или --apply-edits PAYLOAD_JSON EDITS_JSON")
 
     if args.model is None:
         args.model = str(default_model_for_language(args.language))
