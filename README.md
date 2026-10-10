@@ -1,15 +1,12 @@
 # hermes-skill-mlx-whisper
 
-Скилл [Hermes Agent](https://hermes-agent.nousresearch.com/docs) для локального распознавания речи (ru/en) на Apple Silicon через MLX Whisper. Всё считается на машине: ни аудио, ни текст не покидают компьютер.
+Скилл [Hermes Agent](https://hermes-agent.nousresearch.com/docs) для локального распознавания речи на Apple Silicon через MLX Whisper. Всё считается на машине: ни аудио, ни текст не покидают компьютер.
 
 ## Что умеет
 
 - **Локальный STT** — модель выбирается автоматически по языку: русский — whisper-podlodka-turbo q8 (специализирована на русском, база bond005/whisper-podlodka-turbo, MLX-конверсия evilfreelancer), все остальные языки — whisper-large-v3-turbo-8bit (mlx-community)
-- **Полный пайплайн `vad_transcribe.py`**: Silero VAD (паузы/шумы отрезаются) → нарезка на сегменты ≤28 с → Whisper → regex-препасс по словарю ослышек → payload для коррекции терминов
-- **Коррекция терминов по схеме «советчик + судья»** — советчиком выступает основная модель агента (никаких внешних API и ключей не нужно): скрипт пишет `<имя>.correct-payload.json` (базовый текст, канон-термины, low-confidence спаны, субтитры, инструкции), модель целиком правит текст в `<имя>.corrected.txt`, а `--apply-corrections` принимает или отклоняет правки детерминированными гейтами
-- **Субтитры как «второе мнение»** (`--subs file.srt`) — если к аудио есть субтитры (например, с YouTube), коррекция сверяет с ними ослышки, а из субтитров авто-извлекаются канон-термины. Принятие вывода советчика — два детерминированных гейта в коде: word-diff бюджет (никаких переписываний текста) и числовой гейт (числа всегда остаются от Whisper, попытки изменения откатываются и логируются)
-- **Готовый Markdown** — транскрипт блоками ~60 с (`**mm:ss** текст`), метаданные (дата, источник, длительность, модель, время этапов); файл `~/result-mlx-whisper/YYYY-MM-DD_<имя>.md`
-- **Субтитры и форматы** — srt/vtt/txt/tsv/json, таймстампы слов, перевод ru→en (`--task translate`)
+- **Пайплайн `vad_transcribe.py`**: Silero VAD (паузы/шумы отрезаются) → нарезка на сегменты ≤28 с → Whisper → готовый Markdown. Один вызов — один файл `~/result-mlx-whisper/YYYY-MM-DD_<имя>.md`: шапка с контент-метаданными (`--meta-*`) и транскрипт блоками ~60 с (`**mm:ss** текст`). Коррекции текста в скрипте нет — правки ослышек и терминов вносит вызывающий агент в своём пайплайне (например, brain-summary)
+- **Субтитры и форматы** — srt/vtt/txt/tsv/json, таймстампы слов, перевод ru→en (`--task translate`) через сырой CLI
 - **Экономия RAM** — load-run-exit: модель занимает память только на время процесса (~1.85 ГБ пик), демонов нет
 
 ## Установка на чистый Mac
@@ -78,20 +75,21 @@ git clone https://github.com/vokasug/hermes-skill-mlx-whisper $HERMES_HOME/skill
 
 ## Использование
 
-Основной путь — полный пайплайн (запускать именно питоном uv-tool, там mlx):
+Основной путь — пайплайн VAD+STT (запускать именно питоном uv-tool, там mlx):
 
 ```bash
 ~/.local/share/uv/tools/mlx-whisper/bin/python \
-  $HERMES_HOME/skills/media/mlx-whisper/scripts/vad_transcribe.py <аудио> [ещё...] --language ru
+  $HERMES_HOME/skills/media/mlx-whisper/scripts/vad_transcribe.py <аудио> [ещё...] --language ru \
+  [--meta-title "..." --meta-author "..." --meta-date YYYY-MM-DD --meta-url "..."]
 ```
 
 - `--language ru` указывать явно — на коротких клипах авто-детект иногда ошибается. От языка зависит и модель: `ru` → podlodka q8, любой другой → whisper-large-v3-turbo-8bit; `--model <папка>` перекрывает автовыбор
-- `--no-correct` — пропустить подготовку коррекции (без payload)
-- `--terms "Имя, Ещё Имя"` — канонические написания терминов сверх встроенного словаря
-- `--subs <srt/vtt>` — субтитры того же контента как второе мнение для коррекции + авто-экстракция терминов из них
-- `--apply-corrections <payload.json> <corrected.txt>` — применить правки советчика через гейты и переписать MD
+- `--meta-*` — контент-метаданные шапки MD (название, автор, дата публикации, каноническая ссылка); пустые значения запрещены (скрипт падает)
+- `--debug-segments` — дополнительно пишет `<имя>.segments.json` (`[{start, end, text, logprob}]`) — контракт для скиллов-потребителей сегментов
+- `--no-correct` — флаг-заглушка для совместимости вызовов, ни на что не влияет
+- `--for <brain-summary|multilingual-audio-replacement|translated-video-subtitles>` — специфика запуска под скилл-потребителя одним флагом; что делает каждый режим — в [SKILL.md](SKILL.md)
 
-Быстрый MD без VAD и коррекции:
+Быстрый MD без VAD (сплошной текст + таблица сегментов):
 
 ```bash
 python3 $HERMES_HOME/skills/media/mlx-whisper/scripts/transcribe_to_md.py <аудио>
@@ -121,12 +119,10 @@ mlx_whisper ... --task translate <аудио>
 ├── README.md                  # этот файл
 ├── LICENSE                    # MIT
 ├── SKILL.md                   # скилл: frontmatter + инструкции для агента
-├── tests/
-│  └── test_gates.py          # офлайн-тесты гейтов коррекции (без аудио и модели)
 └── scripts/
-    ├── vad_transcribe.py      # полный пайплайн: VAD → STT → payload коррекции → MD; --apply-corrections
+    ├── vad_transcribe.py      # пайплайн: VAD → STT → MD; --debug-segments
     ├── vad_segments.py        # Silero VAD → интервалы речи
-    └── transcribe_to_md.py    # быстрый путь без VAD/коррекции
+    └── transcribe_to_md.py    # быстрый путь без VAD
 ```
 
 ## Лицензия
